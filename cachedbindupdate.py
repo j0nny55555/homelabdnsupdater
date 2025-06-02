@@ -118,6 +118,15 @@ KEY_PATTERNS = [
     'docker:hostname:*',
 ]
 
+########################################################################
+# Note: 'manual_hostname_to_mac' dictionary
+# Once we added the Portainer collection this did not become necessary
+# It is left here so you can use that if you need to in the meantime
+########################################################################
+# manual_hostname_to_mac = {
+#     'hostname': ['macaddress','ipaddress']
+# }
+
 def connect_to_redis():
     """Connects to the Redis database."""
     try:
@@ -154,7 +163,7 @@ def get_data_from_redis(redis_client, pattern):
             value = redis_client.get(key)
             if value:
                 data[key] = json.loads(value)
-            # Filter out older data from cache - limit is currently 2 days old
+            # Filter out older data from cache - limit is currently 2 hours old
             if datetime.strptime(data[key]['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=2) > datetime.now():
                 pass
             else:
@@ -168,6 +177,11 @@ def get_data_from_redis(redis_client, pattern):
 def update_redis_entry(redis_client, key, new_data):
     """Updates an existing Redis entry with new data."""
     new_data["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ########################################################################
+    # There used to be a 'manual_hostname_to_mac' dictionary
+    # Once we added the Portainer collection this did not become necessary
+    # It is left here so you can use that if you need to in the meantime
+    ########################################################################
     # for manual_hostname, manual_mac_ip in manual_hostname_to_mac.items():
     #     manual_mac = manual_mac_ip[0]
     #     manual_address = manual_mac_ip[1]
