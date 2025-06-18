@@ -7,13 +7,20 @@ import dns.tsig
 import ipaddress
 import socket
 import sys
+import time
 from dns.update import Update
 from dns.message import make_query
 from dns.query import tcp
+import dns.name
+import dns.query
 import dns.rdata
+import dns.reversename
+import dns.zone
+import dns.rdatatype
 from configparser import ConfigParser
 from datetime import datetime, timedelta
 from pprint import pprint
+import ipaddress
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 config = ConfigParser()
@@ -38,6 +45,8 @@ ipv6_resolver = config['Config']['IPv6Resolver']
 ipv4_subnetfilter = config['Config']['IPv4SubnetFilter']
 ipv6_subnetfilter = config['Config']['IPv6SubnetFilter']
 ipv4_only_hosts = config['Config']['IPv4OnlyHosts'].split('\n')
+multihost_list = config['Config']['MultiHostList'].split('\n')
+statichosts = config['Config']['StaticHosts'].split('\n')
 dns_subnets = config['Config']['Subnets'].split('\n')
 dns_reversezones = config['Config']['ReverseZones'].split('\n')
 
@@ -102,8 +111,10 @@ resolverObj6.retry = 3
 KEY_PATTERNS = [
     'arp:mac:*',
     'arp:address:*',
+    'arp:hostname:*',
     'ndp:mac:*',
     'ndp:address:*',
+    'ndp:hostname:*',
     'dhcpv4:mac:*',
     'dhcpv4:address:*',
     'dhcpv4:hostname:*',
@@ -116,6 +127,9 @@ KEY_PATTERNS = [
     'docker:mac:*',
     'docker:address:*',
     'docker:hostname:*',
+    'static:mac:*',
+    'static:address:*',
+    'static:hostname:*',
 ]
 
 ########################################################################
@@ -160,16 +174,28 @@ def get_data_from_redis(redis_client, pattern):
     data = {}
     for key in keys:
         try:
-            value = redis_client.get(key)
-            if value:
-                data[key] = json.loads(value)
-            # Filter out older data from cache - limit is currently 2 hours old
-            if datetime.strptime(data[key]['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=2) > datetime.now():
-                pass
+            valueraw = redis_client.get(key)
+            if valueraw:
+                value = json.loads(valueraw)
+            if datetime.strptime(value['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=1) > datetime.now():
+                data[key] = value
             else:
-                print(f"Not using aged {data[key]['last_seen']} Redis data... {key}")
-                #pprint(data[key])
-                del data[key]
+                if debug:
+                    print(f"Not using aged {data[key]['last_seen']} Redis data... {key}")
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"Error decoding JSON for key {key}: {e}")
+    return data
+
+def get_all_data_from_redis(redis_client, pattern):
+    """Retrieves data from Redis matching the given key pattern."""
+    keys = redis_client.keys(pattern)
+    data = {}
+    for key in keys:
+        try:
+            valueraw = redis_client.get(key)
+            if valueraw:
+                value = json.loads(valueraw)
+                data[key] = value
         except (json.JSONDecodeError, TypeError) as e:
             print(f"Error decoding JSON for key {key}: {e}")
     return data
@@ -195,7 +221,7 @@ def update_redis_entry(redis_client, key, new_data):
         # Update existing entry with new data
         for k, v in new_data.items():
             if isinstance(entry.get(k), list):
-                entry[k] = list(set(entry[k] + v)) if v else entry[k]
+                entry[k] = list(set(entry[k] + v)) if v else list(set(entry[k]))
             else:
                 entry[k] = v
         redis_client.set(key, json.dumps(entry))
@@ -282,18 +308,18 @@ def process_arp(redis_client):
                 hostname = arp_entry.get("hostname")
                 hostname = hostname.lower() if hostname else None
                 redis_key_mac = f"arp:mac:{mac}"
-                redis_key_address = f"arp:address:{address}"
-                redis_key_address = f"arp:hostname:{hostname}"
+                redis_key_address = f"arp:address:{ipaddress.IPv4Address(address)}"
+                redis_key_hostname = f"arp:hostname:{hostname}"
                 arp_entry["mac"] = [mac] if mac else []
                 arp_entry["address"] = [address] if address else []
-                arp_entry["address"] = [ address for address in arp_entry["address"] if address.startswith(ipv4_subnetfilter) ]
+                arp_entry["address"] = [ f"{ipaddress.IPv4Address(address)}" for address in arp_entry["address"] if address.startswith(ipv4_subnetfilter) ]
                 arp_entry["hostname"] = [hostname] if hostname else []
                 if mac:
                     update_redis_entry(redis_client, redis_key_mac, arp_entry)
                 if address:
                     update_redis_entry(redis_client, redis_key_address, arp_entry)
                 if hostname:
-                    update_redis_entry(redis_client, redis_key_address, arp_entry)
+                    update_redis_entry(redis_client, redis_key_hostname, arp_entry)
             else:
                 if debug:
                     print(f"Skipped...")
@@ -316,18 +342,18 @@ def process_ndp(redis_client):
                 hostname = ndp_entry.get("hostname")
                 hostname = hostname.lower() if hostname else None
                 redis_key_mac = f"ndp:mac:{mac}"
-                redis_key_address = f"ndp:address:{address}"
-                redis_key_address = f"ndp:hostname:{hostname}"
+                redis_key_address = f"ndp:address:{ipaddress.IPv6Address(address)}"
+                redis_key_hostname = f"ndp:hostname:{hostname}"
                 ndp_entry["mac"] = [mac] if mac else []
                 ndp_entry["address"] = [address] if address else []
-                ndp_entry["address"] = [ address for address in ndp_entry["address"] if address.startswith(ipv6_subnetfilter) ]
+                ndp_entry["address"] = [ f"{ipaddress.IPv6Address(address)}" for address in ndp_entry["address"] if address.startswith(ipv6_subnetfilter) ]
                 ndp_entry["hostname"] = [hostname] if hostname else []
                 if mac:
                     update_redis_entry(redis_client, redis_key_mac, ndp_entry)
                 if address:
                     update_redis_entry(redis_client, redis_key_address, ndp_entry)
                 if hostname:
-                    update_redis_entry(redis_client, redis_key_address, ndp_entry)
+                    update_redis_entry(redis_client, redis_key_hostname, ndp_entry)
             else:
                 if debug:
                     print(f"Skipped...")
@@ -338,12 +364,12 @@ def process_ndp(redis_client):
 
 def process_dhcpv4(redis_client):
     """Collects and stores DHCPv4 data in Redis."""
-    data = get_opnsense_data("/dhcpv4/leases/searchLease")  # Changed endpoint to static leases
+    data = get_opnsense_data("/dhcpv4/leases/searchLease")
     if data:
         if debug:
             pprint(data['rows'][0:5])
         for dhcpv4_entry in data['rows']:
-            address = dhcpv4_entry.get("address")
+            address = f"{ipaddress.IPv4Address(dhcpv4_entry.get("address"))}"
             mac = dhcpv4_entry.get("mac")
             mac = mac.lower()
             hostname = dhcpv4_entry.get("hostname")
@@ -366,12 +392,12 @@ def process_dhcpv4(redis_client):
 
 def process_dhcpv6(redis_client):
     """Collects and stores DHCPv6 data in Redis."""
-    data = get_opnsense_data("/dhcpv6/leases/searchLease") # Changed endpoint to static leases
+    data = get_opnsense_data("/dhcpv6/leases/searchLease")
     if data:
         if debug:
             pprint(data['rows'][0:5])
         for dhcpv6_entry in data['rows']:
-            address = dhcpv6_entry.get("address")
+            address = f"{ipaddress.IPv6Address(dhcpv6_entry.get("address"))}"
             mac = dhcpv6_entry.get("mac")
             mac = mac.lower()
             hostname = dhcpv6_entry.get("hostname")
@@ -394,7 +420,7 @@ def process_dhcpv6(redis_client):
 
 def process_interfaces(redis_client):
     """Collects and stores OPNSense Interface data in Redis."""
-    data = get_opnsense_data("/diagnostics/interface/getInterfaceConfig") # Changed endpoint to static leases
+    data = get_opnsense_data("/diagnostics/interface/getInterfaceConfig")
     if data:
         if debug:
             pprint(data)
@@ -402,9 +428,9 @@ def process_interfaces(redis_client):
             cleaned_entry = {}
             hostname = 'opnsense'
             ipv4addresses = [ ipv4address['ipaddr'] for ipv4address in interface_entry['ipv4'] ]
-            ipv4addresses = [ ipv4address for ipv4address in ipv4addresses if ipv4address.startswith(ipv4_subnetfilter) ]
+            ipv4addresses = [ f"{ipaddress.IPv4Address(ipv4address)}" for ipv4address in ipv4addresses if ipv4address.startswith(ipv4_subnetfilter) ]
             ipv6addresses = [ ipv6address['ipaddr'] for ipv6address in interface_entry['ipv6'] ]
-            ipv6addresses = [ ipv6address for ipv6address in ipv6addresses if ipv6address.startswith(ipv6_subnetfilter) ]
+            ipv6addresses = [ f"{ipaddress.IPv6Address(ipv6address)}" for ipv6address in ipv6addresses if ipv6address.startswith(ipv6_subnetfilter) ]
             alladdresses = list(set(ipv4addresses + ipv6addresses))
             mac = interface_entry['macaddr']
             redis_key_mac = f"interface:mac:{mac}"
@@ -423,9 +449,9 @@ def process_interfaces(redis_client):
                 if address:
                     redis_key_address = f"interface:address:{address}"
                     update_redis_entry(redis_client, redis_key_address, cleaned_entry)
-        #print(f"DHCPv6 entrys pulled: {len(data['rows'])}")
-    #list_of_dhcpv6_keys = redis_client.keys("dhcpv6:*")
-    #print(f"DHCPv6 keys in Redis: {len(list_of_dhcpv6_keys)}")
+        print(f"Interface entrys pulled: {len(data)}")
+    list_of_interface_keys = redis_client.keys("interface:*")
+    print(f"Interface keys in Redis: {len(list_of_interface_keys)}")
 
 def process_docker_containers(redis_client):
     # Step 1: Authenticate with Portainer
@@ -435,75 +461,59 @@ def process_docker_containers(redis_client):
     if response.status_code != 200:
         print("Authentication failed")
         exit()
-
     cookies = response.cookies
-
     # Step 2: Retrieve List of Endpoints (Docker Hosts)
-    endpoints_url = f"{portainer_url}/api/endpoints"
+    endpoints_url = f"{portainer_url}/api/endpoints?provisioned=true"
     headers = {'Content-Type': 'application/json'}
     response = requests.get(endpoints_url, headers=headers, cookies=cookies)
-
     if response.status_code != 200:
         print("Failed to retrieve endpoints")
         exit()
-
     endpoints = response.json()
     print(f"Found {len(endpoints)} endpoint(s)")
-
     container_list = []
-
     # Step 3: Iterate Over Endpoints and Containers
     for endpoint in endpoints:
         endpoint_id = endpoint['Id']
         endpoint_status = endpoint['Status']
-        if endpoint['Name'] in ['SOC']:
-            continue
         print(f"Looking into {endpoint['Name']} with status {endpoint_status}...")
         print(f"Which has {len(endpoint['Snapshots'][0]['DockerSnapshotRaw']['Containers'])} Docker Snapshots Container Definitions")
-        
         if endpoint_status != 1:
             print(f"Skipping inactive endpoint...")
             continue
-
-        containers_url = f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json"
+        containers_url = f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json?all=true"
         response = requests.get(containers_url, headers=headers, cookies=cookies)
-        
         if response.status_code != 200:
             print(f"Failed to retrieve containers from endpoint {endpoint_id}")
             #pprint(response.text)
             continue
-
         containers = response.json()
         for container in containers:
             if 'Id' in container:
                 pass
             else:
                 continue
-
             container_id = container['Id']
-            
             # Step 4: Retrieve Detailed Container Info
             container_info_url = f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/{container_id}/json"
             response = requests.get(container_info_url, headers=headers, cookies=cookies)
-            
             if response.status_code != 200:
                 print(f"Failed to get details for container {container_id}")
                 continue
-
             container_details = response.json()
-            
             # Step 5: Extract Hostname
             hostname = container_details.get('Config', {}).get('Hostname', 'N/A')
-            
+            # check if the container is running
+            if container_details.get('State', {}).get('Running') is not True:
+                print(f"Container {container_id} - {hostname} is not running, skipping...")
+                continue
             # Step 6: Extract IP and MAC Address from NetworkSettings
             network_settings = container_details.get('NetworkSettings', {})
             networks = network_settings.get('Networks', {})
-            
             ipv4_address = []
             ipv6_address = []
             addresses = []
             mac_address = []
-            
             if networks:
                 for net_name, data in networks.items():
                     goodNetwork = False
@@ -520,286 +530,236 @@ def process_docker_containers(redis_client):
                             if data['IPAMConfig']['IPv6Address'].startswith(ipv6_subnetfilter):
                                 goodNetwork = True
                                 ipv6_address.append(data['IPAMConfig']['IPv6Address'])
+                    else:
+                        if debug:
+                            print(f"Network {net_name} has no IPAMConfig, skipping...")
                     if goodNetwork:
                         mac_address.append(data.get('MacAddress'))
-                ipv4_address = list(set([ip for ip in ipv4_address if ip.startswith(ipv4_subnetfilter)]))
-                ipv6_address = list(set([ip for ip in ipv6_address if ip.startswith(ipv6_subnetfilter)]))
+                ipv4_address = list(set([f"{ipaddress.IPv4Address(ip)}" for ip in ipv4_address if ip.startswith(ipv4_subnetfilter)]))
+                ipv6_address = list(set([f"{ipaddress.IPv6Address(ip)}" for ip in ipv6_address if ip.startswith(ipv6_subnetfilter)]))
             addresses = list(set(ipv4_address + ipv6_address))
-            #print(f"Container ID: {container_id}")
-            #print(f"Hostname:       {hostname}")
-            #print(f"IPv4 Address:     {ipv4_address or 'N/A'}")
-            #print(f"IPv6 Address:     {ipv6_address or 'N/A'}")
-            #print(f"MAC Address:    {mac_address or 'N/A'}")
-            #print("-" * 50)
-            if len(ipv4_address) > 0:
-                container_list.append({'hostname': hostname, 'macaddr': mac_address[0], 'address': addresses})
-    #pprint(container_list)
+            if len(mac_address) > 0:
+                container_list.append({'hostname': [hostname], 'mac': list(set(mac_address)), 'address': list(set(addresses))})
     for container_entry in container_list:
-            mac = container_entry['macaddr']
-            hostname = container_entry['hostname']
+            macs = container_entry['mac']
+            hostnames = container_entry['hostname']
             alladdresses = container_entry["address"]
-            redis_key_mac = f"docker:mac:{mac}"
-            redis_key_hostname = f"docker:hostname:{hostname}"
-            container_entry["mac"] = [mac] if mac else []
-            container_entry["hostname"] = [hostname] if hostname else []
-            if mac:
+            for mac in macs:
+                redis_key_mac = f"docker:mac:{mac}"
                 update_redis_entry(redis_client, redis_key_mac, container_entry)
-            if hostname:
+            for hostname in hostnames:
+                redis_key_hostname = f"docker:hostname:{hostname}"
                 update_redis_entry(redis_client, redis_key_hostname, container_entry)
             for address in alladdresses:
                 if address:
                     redis_key_address = f"docker:address:{address}"
                     update_redis_entry(redis_client, redis_key_address, container_entry)
 
-def create_dns_updates(hosts_data):
+def create_dns_updatesv2(hosts_data):
     print_existing = False  # For debugging purposes only
-    
+
+    def get_ptr_domain(ip_address):
+        if ':' in ip_address:  # IPv6
+            ipv6_obj = ipaddress.IPv6Address(ip_address)
+            subnet = ip_address[0:19]
+            bytes_value = ipv6_obj._ip.to_bytes(16, 'big')
+            nibbles = []
+            for byte in bytes_value:
+                hex_byte = '{:02x}'.format(byte)
+                for c in hex_byte:
+                    nibbles.append(c)
+            reversed_nibbles = list(reversed(nibbles))
+            ptr_domain = '.'.join(reversed_nibbles) + '.ip6.arpa.'
+        else:  # IPv4
+            octets = ip_address.split('.')
+            subnet = '.'.join(octets[0:3])
+            ptr_domain = '.'.join(reversed(octets)) + '.in-addr.arpa.'
+        return subnet, ptr_domain
+
+    def get_forward_records_for_zone(nameserver, zone_name):
+        """Performs an iterative zone transfer and returns all A and AAAA records."""
+        try:
+            # Initialize the zone transfer
+            xfr = dns.query.xfr(nameserver, zone_name)
+            zone = dns.zone.from_xfr(xfr)
+            records = {}
+            
+            for name in zone.nodes.keys():
+                node = zone.nodes[name]
+                for rdtype in [dns.rdatatype.A, dns.rdatatype.AAAA]:
+                    if any(rdataset.rdtype == rdtype for rdataset in node.rdatasets):
+                        ips = []
+                        for rdataset in node.rdatasets:
+                            if rdataset.rdtype == rdtype:
+                                for rdata in rdataset:
+                                    ips.append(str(rdata.address))
+                        records[str(name)] = list(set(ips + records.get(str(name), [])))
+            return records
+        except Exception as e:
+            print(f"Error performing zone transfer: {e}")
+            return {}
+
+    def get_reverse_records_for_zone(nameserver, reverse_zone):
+        """Performs a zone transfer for the reverse DNS zone corresponding to a subnet
+        and extracts the PTR records."""
+        try:
+            # Initiate the zone transfer
+            axfr = dns.query.xfr(nameserver, zone=reverse_zone)
+            zone = dns.zone.from_xfr(axfr)
+            # Extract PTR records, as IP (reversed from PTR) and hostnames (targets)
+            ptr_records = {}
+            for name, node in zone.nodes.items():
+                rdatasets = node.rdatasets
+                for rdataset in rdatasets:
+                    if rdataset.rdtype == dns.rdatatype.PTR:
+                        for rdata in rdataset:
+                            ptr_address = f"{name}.{reverse_zone}"
+                            text = ""
+                            if ptr_address.endswith('.in-addr.arpa.'):
+                                conversion = ptr_address[:-14]
+                                text = ".".join(reversed(conversion.split('.')))
+                            elif ptr_address.endswith('.ip6.arpa.'):
+                                conversion = ptr_address[:-10]
+                                conversion = "".join(reversed(conversion.split('.')))
+                                parts = []
+                                for i in range(0, len(conversion), 4):
+                                    parts.append("".join(conversion[i : i + 4]))
+                                text = ":".join(parts)
+                            ip_address = f"{text}"
+                            if ':' in ip_address:
+                                ip_address = f"{ipaddress.IPv6Address(ip_address)}"
+                            else:
+                                ip_address = f"{ipaddress.IPv4Address(ip_address)}"
+                            if ip_address in ptr_records:
+                                if str(rdata.target) not in ptr_records[ip_address]:
+                                    ptr_records[ip_address].append(str(rdata.target))
+                            else:
+                                ptr_records[ip_address] = [str(rdata.target)]
+            return ptr_records
+
+        except Exception as e:
+            print(f"Error performing zone transfer for {reverse_zone}: {e}")
+            return {}
+
+    # Update A and AAAA IN Forward Records
+    forward_records = get_forward_records_for_zone(dns_server, dns_domain)
+    debug = False
+    if debug:
+        print("host data:")
+        pprint(hosts_data)
+        print("forward records:")
+        pprint(forward_records)
+    print(f"IN - checking the updates list for add/delete to existing...")
     # First pass: Add new records
+    print_existing = False
     for hostname, ips in hosts_data.items():
         if not ips:
+            # skip
             continue
-
-        for ip_address in ips:
-            try:
-                # Determine IP version and resolver
-                ip_obj = ipaddress.ip_address(ip_address)
-                is_ipv6 = ip_obj.version == 6
-                resolver = resolverObj6 if is_ipv6 else resolverObj4
-                address_family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-                record_type = 'AAAA' if is_ipv6 else 'A'
-                # Skip and Remove IPv6 if it exists for IPv4-only hosts
-                if hostname in ipv4_only_hosts and is_ipv6:
-                    fqdn = f"{hostname}.{dns_domain}"
-                    existing_ips = []
-                    try:
-                        response = resolver.resolve(fqdn, record_type)
-                    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
-                        continue
-                    existing_ips.extend([rdata.address for rdata in response])
-                    if ip_address in existing_ips:
-                        print(f"Removing AAAA record for {fqdn}: {ip_address}")
-                        fwd_update.delete(hostname, 'AAAA', ip_address)
-                    continue
-            except ValueError as e:
-                print(f"Invalid IP format: {ip_address}")
-                continue
-
-            # Process A/AAAA records
-            try:
-                fqdn = f"{hostname}.{dns_domain}"
-                existing_ips = []
-                response = resolver.resolve(fqdn, record_type)
-                existing_ips.extend([rdata.address for rdata in response])
-                
-                if ip_address not in existing_ips:
-                    print(f"Adding {record_type} record: {fqdn} -> {ip_address}")
-                    fwd_update.add(hostname, 3600, record_type, ip_address)
-                    pending_changes['add'][record_type].append((hostname, ip_address))
-            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
-                print(f"Adding {record_type} record: {fqdn} -> {ip_address} - NoAnswer/NXDOMAIN/NoNameservers")
-                fwd_update.add(hostname, 3600, record_type, ip_address)
-                pending_changes['add'][record_type].append((hostname, ip_address))
-            except Exception as e:
-                print(f"Skipping {record_type} record for {fqdn} -> {ip_address}")
-                print(f"Error resolving {record_type} records: {e}")
-
-            # Process PTR records
-            try:
-                fqdn = f"{hostname}.{dns_domain}."
-                if is_ipv6:
-                    subnet = ip_address[0:19]
-                    ipv6_obj = ipaddress.IPv6Address(ip_address)
-                    bytes_value = ipv6_obj._ip.to_bytes(16, 'big')
-                    nibbles = []
-                    for byte in bytes_value:
-                        hex_byte = '{:02x}'.format(byte)
-                        for c in hex_byte:
-                            nibbles.append(c)
-                    reversed_nibbles = list(reversed(nibbles))
-                    ptr_domain = '.'.join(reversed_nibbles) + '.ip6.arpa.'
-                else:
-                    octets = ip_address.split('.')
-                    subnet = '.'.join(octets[0:3])
-                    ptr_domain = '.'.join(reversed(octets)) + '.in-addr.arpa.'
-
-                response = resolver.resolve(ptr_domain, 'PTR', 'IN')
-                existing_hostnames = [rdata.target.to_text() for rdata in response]
-                existing_hostnames = [hostname.lower() for hostname in existing_hostnames]
-                if f"{fqdn}" not in existing_hostnames:
-                    print(f"Adding PTR record: {ptr_domain} -> {fqdn} - FQDN not in existing hostnames")
-                    ptr_updates[subnet].add(ptr_domain, 3600, 'PTR', fqdn)
-                    pending_changes['add'][f'PTR{"IPv6" if is_ipv6 else "IPv4"}'].append((ptr_domain, ip_address))
-                else:
+        fqdn = f"{hostname}.{dns_domain}"
+        if hostname in forward_records.keys():
+            for ip_address in ips:
+                ip_type = 'AAAA' if ':' in ip_address else 'A'
+                if ip_address in forward_records[hostname]:
                     if print_existing:
-                        print(f"Found PTR record: {','.join(existing_hostnames)} for {fqdn} - No action needed")
-            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
-                print(f"Adding PTR record: {ptr_domain} -> {fqdn} - NoAnswer/NXDOMAIN/NoNameservers")
-                ptr_updates[subnet].add(ptr_domain, 3600, 'PTR', fqdn)
-                pending_changes['add'][f'PTR{"IPv6" if is_ipv6 else "IPv4"}'].append((ptr_domain, ip_address))
-            except Exception as e:
-                print(f"Skipping {record_type} record for {ip_address} -> {fqdn}")
-                print(f"Error resolving {ptr_domain} for {fqdn} records: {e}")
+                        print(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
+                    continue
+                else:
+                    print(f"Adding {ip_type} record: {fqdn} -> {ip_address}")
+                    fwd_update.add(hostname, 3600, ip_type, ip_address)
+                    pending_changes['add'][ip_type].append((hostname, ip_address))
+            for ip_address in forward_records[hostname]:
+                ip_type = 'AAAA' if ':' in ip_address else 'A'
+                if ip_address in ips:
+                    if print_existing:
+                        print(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
+                    continue
+                else:
+                    print(f"Removing {ip_type} record: {ip_address} from {fqdn}")
+                    fwd_update.delete(hostname, ip_type, ip_address)
+                    pending_changes['delete'][ip_type].append((fqdn, ip_address))
+        else:
+            for ip_address in ips:
+                ip_type = 'AAAA' if ':' in ip_address else 'A'
+                print(f"Adding {ip_type} record: {fqdn} -> {ip_address}")
+                fwd_update.add(hostname, 3600, ip_type, ip_address)
+                pending_changes['add'][ip_type].append((hostname, ip_address))
+    for hostname, ips in forward_records.items():
+        fqdn = f"{hostname}.{dns_domain}"
+        if hostname in hosts_data.keys():
+            if print_existing:
+                print(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
+            continue
+        else:
+            for ip_address in ips:
+                ip_type = 'AAAA' if ':' in ip_address else 'A'
+                print(f"Removing {ip_type} record: {ip_address} from {fqdn}")
+                fwd_update.delete(hostname, ip_type, ip_address)
+                pending_changes['delete'][ip_type].append((fqdn, ip_address))
+    print(f"PTR - checking the updates list for add/delete to existing...")
+    # Update Reverse PTR Records
+    for subnet_update, ptr_update in ptr_updates.items():
+        if subnet_update not in reverse_zones:
+            print(f"Skipping PTR cleanup for unknown subnet: {subnet_update}")
+        reverse_zone = reverse_zones[subnet_update]
+        print(f"Checking PTR records for subnet {subnet_update} in zone {reverse_zone}...")
+        ptr_records = get_reverse_records_for_zone(dns_server, reverse_zone)
+        if '.' in subnet_update:
+            subnet = f"{subnet_update}0/24"
+        else:
+            subnet = f"{subnet_update}:/64"
+        print(f"Found {len(ptr_records)} PTR records in subnet {subnet}.")
+        if debug:
+            pprint(ptr_records)
 
-        do_cleanup = True
-        if do_cleanup:
-            # Second pass: Remove records not present in reference data
-            def get_current_records(fqdn, record_type, resolver):
-                """Get all current DNS records of a given type."""
-                current_records = set()
-                try:
-                    response = resolver.resolve(fqdn, record_type)
-                    for rdata in response:
-                        if record_type == 'A':
-                            current_records.add((rdata.address, rdata.rdtype))
-                        elif record_type == 'AAAA':
-                            current_records.add((rdata.address, rdata.rdtype))
-                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
-                    pass
-                except Exception as e:
-                    print(f"Error resolving {record_type} records: {e}")
-                return current_records
-
-            def get_current_ptr_records(ptr_domain):
-                """Get all current PTR records."""
-                current_ptr_records = set()
-                for subnet, reverse_zone in reverse_zones.items():
-                    try:
-                        resolver = dns.resolver.Resolver()
-                        resolver.nameservers = [dns_server]
-                        response = resolver.resolve(ptr_domain, 'PTR', 'IN')
-                        for rdata in response:
-                            #ptr_domain = f"{rdata.domain}."
-                            rdatafqdn = rdata.target.to_text()
-                            current_ptr_records.add((ptr_domain, rdatafqdn.lower()))
-                    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+        for hostname, ips in hosts_data.items():
+            report_findings = True
+            if not ips:
+                # skip
+                continue
+            subnet_ips = [ ip for ip in ips if ip.startswith(subnet_update) ]
+            if len(subnet_ips) == 0:
+                # skip
+                continue
+            fqdn = f"{hostname}.{dns_domain}."
+            # Check each IP and add if missing
+            for ip_address in subnet_ips:
+                if ip_address in ptr_records.keys():
+                    if fqdn in ptr_records[ip_address]:
+                        # Keep
+                        continue
+                    else:
+                        # Add
+                        ptr_subnet, ptr_domain = get_ptr_domain(ip_address)
+                        if report_findings:
+                            print(f"Adding PTR record: {ptr_domain} -> {fqdn} - missing FQDN")
+                        ptr_updates[subnet_update].add(ptr_domain, 3600, 'PTR', fqdn)
+                        pending_changes['add'][f'PTR{"IPv6" if ":" in ip_address else "IPv4"}'].append((ptr_domain, fqdn))
                         pass
-                    except Exception as e:
-                        print(f"Error resolving PTR records for {reverse_zone}: {e}")
-                
-                return current_ptr_records
-
-            # Set FQDN for A and AAAA record lookup
-            fqdn = f"{hostname}.{dns_domain}"
-            # Get all current A records
-            current_a_records = get_current_records(fqdn, 'A', resolverObj4)
-            # Get all current AAAA records
-            current_aaaa_records = get_current_records(fqdn, 'AAAA', resolverObj6)
-
-            #pprint(current_aaaa_records)
-
-            # Get all current PTR records
-            fqdn = f"{hostname}.{dns_domain}"
-            if is_ipv6:
-                subnet = ip_address[0:19]
-                ipv6_obj = ipaddress.IPv6Address(ip_address)
-                bytes_value = ipv6_obj._ip.to_bytes(16, 'big')
-                nibbles = []
-                for byte in bytes_value:
-                    hex_byte = '{:02x}'.format(byte)
-                    for c in hex_byte:
-                        nibbles.append(c)
-                reversed_nibbles = list(reversed(nibbles))
-                ptr_domain = '.'.join(reversed_nibbles) + '.ip6.arpa.'
-            else:
-                octets = ip_address.split('.')
-                subnet = '.'.join(octets[0:3])
-                ptr_domain = '.'.join(reversed(octets)) + '.in-addr.arpa.'
-            current_ptr_records = get_current_ptr_records(ptr_domain)  # Modify to handle IPv4 and IPv6 properly
-            #print(f"Found {len(current_a_records)} current A records.")
-            #print(f"Found {len(current_aaaa_records)} current AAAA records.")
-            #print(f"Found {len(current_ptr_records)} current PTR records.")
-
-            # Remove A records not in reference data
-            for (ip_address, rtype) in current_a_records:
-                if ip_address not in [ip for ips in hosts_data.values() for ip in ips]:
-                    hostname_find = None
-                    for hn, ips in hosts_data.items():
-                        if ip_address in ips:
-                            hostname_find = hn
-                            break
-                    
-                    if hostname_find:
-                        fqdn = f"{hostname_find}.{dns_domain}"
-                        print(f"Removing A record: {ip_address} from {fqdn}")
-                        fwd_update.delete(hostname_find, 'A', ip_address)
-                        pending_changes['delete']['A'].append((hostname_find, ip_address))
+                else:
+                    # Add
+                    ptr_subnet, ptr_domain = get_ptr_domain(ip_address)
+                    if report_findings:
+                        print(f"Adding PTR record: {ptr_domain} -> {fqdn} - missing IP + FQDN")
+                    ptr_updates[subnet_update].add(ptr_domain, 3600, 'PTR', fqdn)
+                    pending_changes['add'][f'PTR{"IPv6" if ":" in ip_address else "IPv4"}'].append((ptr_domain, fqdn))
+                    pass
+            for ptr_ip_address, ptr_fqdns in ptr_records.items():
+                if fqdn in ptr_fqdns:
+                    if ptr_ip_address in subnet_ips:
+                        # Keep
+                        continue
                     else:
-                        fqdn = f"{hostname}.{dns_domain}"
-                        print(f"Removing A record: {ip_address} from {fqdn}")
-                        fwd_update.delete(hostname, 'A', ip_address)
-                        pending_changes['delete']['A'].append((hostname, ip_address))
-
-            # Remove AAAA records not in reference data
-            for (ip_address, rtype) in current_aaaa_records:
-                if ip_address not in [ip for ips in hosts_data.values() for ip in ips]:
-                    hostname_find = None
-                    for hn, ips in hosts_data.items():
-                        if ip_address in ips:
-                            hostname_find = hn
-                            break
-
-                    if hostname_find:
-                        fqdn = f"{hostname_find}.{dns_domain}"
-                        print(f"Removing AAAA record: {ip_address} from {fqdn}")
-                        fwd_update.delete(hostname_find, 'AAAA', ip_address)
-                        pending_changes['delete']['AAAA'].append((hostname_find, ip_address))
-                    else:
-                        fqdn = f"{hostname}.{dns_domain}"
-                        print(f"Removing AAAA record: {ip_address} from {fqdn}")
-                        fwd_update.delete(hostname, 'AAAA', ip_address)
-                        pending_changes['delete']['AAAA'].append((hostname, ip_address))
-
-            doing_ptr_cleanup = False
-            if doing_ptr_cleanup:
-                # Remove PTR records not in reference data
-                for (ptr_domain, target) in current_ptr_records:
-                    matching_ip = None
-                    hostname_find = None
-                    for hn, ips in hosts_data.items():
-                        for ip in ips:
-                            if ":" in ip:  # IPv6
-                                ipv6_obj = ipaddress.IPv6Address(ip)
-                                subnet = ip[0:19]
-                                bytes_value = ipv6_obj._ip.to_bytes(16, 'big')
-                                nibbles = []
-                                for byte in bytes_value:
-                                    hex_byte = '{:02x}'.format(byte)
-                                    for c in hex_byte:
-                                        nibbles.append(c)
-                                reversed_nibbles = list(reversed(nibbles))
-                                ptr_domain_to_check = '.'.join(reversed_nibbles) + '.ip6.arpa.'
-                            else:  # IPv4
-                                octets = ip.split('.')
-                                subnet = '.'.join(octets[0:3])
-                                ptr_domain_to_check = '.'.join(reversed(octets)) + '.in-addr.arpa.'
-                            
-                            if ptr_domain == ptr_domain_to_check:
-                                matching_ip = ip
-                                hostname_find = hn
-                                break
-                    fqdn = f"{hostname_find}.{dns_domain}."
-                    if not matching_ip:
-                        print(f"Removing PTR record: {ptr_domain} -> {target}")
-                        # Remove the PTR record from the appropriate reverse zone
-                        for subnet, reverse_zone in reverse_zones.items():
-                            try:
-                                ptr_update_resolver = dns.resolver.Resolver()
-                                ptr_update_resolver.nameservers = [dns_server]
-                                response = ptr_update_resolver.resolve(ptr_domain, 'PTR')
-                                if len(response) == 0 or response[0].target != target:
-                                    print(f"Skipping PTR record removal - no matching record found")
-                                    continue
-                            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
-                                pass
-                            try:
-                                # Remove the PTR record
-                                print(f"Removing PTR record: {ip_address} from {fqdn}")
-                                ptr_updates[subnet].delete(ptr_domain, 'PTR', fqdn)
-                                pending_changes['delete'][f'PTR{"IPv6" if ":" in ip else "IPv4"}'].append((ptr_domain, fqdn))
-                        
-                            except Exception as e:
-                                print(f"Error removing PTR record {ptr_domain}: {e}")
-
+                        ptr_subnet, ptr_domain = get_ptr_domain(ptr_ip_address)
+                        # Delete
+                        if report_findings:
+                            print(f"Removing PTR record: {ptr_ip_address} -> {fqdn} - IP for Hostname {hostname} not found in hosts_data")
+                        ptr_updates[subnet_update].delete(ptr_domain, 'PTR', fqdn)
+                        pending_changes['delete'][f'PTR{"IPv6" if ":" in ptr_ip_address else "IPv4"}'].append((ptr_domain, fqdn))
+                        pass
+                else:
+                    # Skip - fqdn is not in this record set
+                    continue
     return pending_changes
 
 def main():
@@ -812,8 +772,8 @@ def main():
         return
     print("Connected to Redis.")
 
-    #list_of_arp_keys = redis_client.keys("*")
-    #for key in list_of_arp_keys:
+    #list_of_keys = redis_client.keys("*")
+    #for key in list_of_keys:
     #   redis_client.delete(key)
 
     # Collect and process data
@@ -835,6 +795,36 @@ def main():
     print("Collecting Docker Container data...")
     process_docker_containers(redis_client)
 
+    print("Collecting Static Host data...")
+    staticrecords = {}
+    for statichost in statichosts:
+        staticrecord = {
+            'hostname': [],
+            'mac': [],
+            'address': []
+        }
+        statichostsplit = statichost.split('/')
+        for element in range(len(statichostsplit)):
+            if statichostsplit[element] == 'hostname':
+                staticrecord['hostname'].append(statichostsplit[element + 1])
+                if staticrecord['hostname'][0] not in staticrecords:
+                    staticrecords[staticrecord['hostname'][0]] = {}
+            if statichostsplit[element] == 'mac':
+                staticrecord['mac'].append(statichostsplit[element + 1])
+            if statichostsplit[element] == 'address':
+                staticrecord['address'].append(statichostsplit[element + 1])
+        staticrecords[staticrecord['hostname'][0]]['hostname'] = list(set(staticrecord['hostname'] + staticrecords[staticrecord['hostname'][0]].get('hostname', [])))
+        staticrecords[staticrecord['hostname'][0]]['mac'] = list(set(staticrecord['mac'] + staticrecords[staticrecord['hostname'][0]].get('mac', [])))
+        staticrecords[staticrecord['hostname'][0]]['address'] = list(set(staticrecord['address'] + staticrecords[staticrecord['hostname'][0]].get('address', [])))
+    for hostname, record in staticrecords.items():
+        redis_key_hostname = f"static:hostname:{hostname}"
+        update_redis_entry(redis_client, redis_key_hostname, record)
+        for mac in record['mac']:
+            redis_key_mac = f"static:mac:{mac}"
+            update_redis_entry(redis_client, redis_key_mac, record)
+        for address in record['address']:
+            redis_key_address = f"static:address:{address}"
+            update_redis_entry(redis_client, redis_key_address, record)
     print("Data collection complete.")
 
     debug = False
@@ -852,6 +842,71 @@ def main():
 
         pprint(slimmed_cached_data)
 
+    # Clean up stale records
+    print("Cleaning up stale records...")
+    for pattern in KEY_PATTERNS:
+        cached_data = get_all_data_from_redis(redis_client, pattern)
+        for k, v in cached_data.items():
+            ips_to_remove = []
+            hostname = v.get('hostname', [None])
+            hostname = hostname[0] if hostname else None
+            if datetime.strptime(v['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=4) <= datetime.now():
+                print(f"Removing {k} as last_seen is older than 4 hours")
+                redis_client.delete(k)
+                continue
+            for key, value in v.items():
+                if key == 'address':
+                    if len(value) == 0:
+                        print(f"Removing {k} as no addresses remain")
+                        redis_client.delete(k)
+                        continue
+                    for address in value:
+                        addressgood = False
+                        # Skip IPv6 for IPv4-only hosts
+                        if hostname in ipv4_only_hosts and ':' in address:
+                            print(f"Cleaning up IPv6 record for {address} in {k} IPv4 only host {hostname}")
+                        else:
+                            address_pattern = f"*:address:{address}"
+                            check_data = get_data_from_redis(redis_client, address_pattern)
+                            if check_data:
+                                for check_key, check_value in check_data.items():
+                                    if check_value:
+                                        if 'last_seen' in check_value:
+                                            if datetime.strptime(check_value['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=1) <= datetime.now():
+                                                print(f"Cleaning up stale record for {address} in {k} with 'last_seen' of {check_value['last_seen']}")
+                                            else:
+                                                if debug:
+                                                    print(f"Keeping record for {address} in {k}")
+                                                addressgood = True
+                                                break
+                                        else:
+                                            print(f"Cleaning up stale record for {address} in {k} no last_seen value")
+                                    else:
+                                        if debug:
+                                            print(f"Cleaning up stale record for {address} in {k} no check value")
+                            else:
+                                if debug:
+                                    print(f"Cleaning up stale record for {address} in {k} no check data")
+                        if not addressgood:
+                            ips_to_remove.append(address)
+            if len(ips_to_remove) > 0:
+                ips_to_remove = list(set(ips_to_remove))
+                cached_data_cleanup = get_data_from_redis(redis_client, '*')
+                for k_cleanup, v_cleanup in cached_data_cleanup.items():
+                    if v_cleanup and 'address' in v_cleanup:
+                        before = len(v_cleanup.get('address', []))
+                        v_cleanup['address'] = list(set(v_cleanup.get('address', [])) - set(ips_to_remove))
+                        after = len(v_cleanup.get('address', []))
+                        if before != after and after > 0:
+                            redis_client.set(k_cleanup, json.dumps(v_cleanup))
+                            print(f"Updated {k_cleanup} with {before} -> {after} addresses after cleanup")
+                        elif after == 0:
+                            redis_client.delete(k_cleanup)
+                            print(f"Deleted {k_cleanup} after cleanup as no addresses remain")
+                redis_client.save()
+                time.sleep(2)
+    #sys.exit(0)
+    
     # Assuming get_data_from_redis is already defined and available
     all_data = []
     for pattern in KEY_PATTERNS:
@@ -866,100 +921,121 @@ def main():
             #             break
             if not skipdata:
                 all_data.append(v)
+
+    cleaned_data = []
+    for value_dict in all_data:
+        if 'address' in value_dict and 'mac' in value_dict:
+            if len(value_dict['address']) > 0 and len(value_dict['mac']) > 0:
+                cleaned_data.append(value_dict)
+    print("Data cleanup complete.")
     #pprint(all_data)
     #sys.exit(0)
+    print("Creating hostname to IP and MAC to IP from Redis data and DNS lookups...")
     mac_to_ips = {}
     hostname_to_ips = {}
     mac_to_ips_with_no_hostname = {}
     # Get Hostname to IP list setup
-    for value_dict in all_data:
+    for value_dict in cleaned_data:
         addresses = value_dict.get('address', [])
         macs = value_dict.get('mac', [])
         hostnames = value_dict.get('hostname', [])
-        
-        for address in addresses:
-            # We query for the reverse PTR to get an additional hostnames
-            existing_hostnames = []
-            try:
-                # Determine IP version and resolver
-                ip_obj = ipaddress.ip_address(address)
-                is_ipv6 = ip_obj.version == 6
-                resolver = resolverObj6 if is_ipv6 else resolverObj4
-                address_family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-                record_type = 'AAAA' if is_ipv6 else 'A'
-            except ValueError as e:
-                print(f"Invalid IP format: {address}")
-                continue
-            try:
-                if is_ipv6:
-                    subnet = address[0:19]
-                    ipv6_obj = ipaddress.IPv6Address(address)
-                    bytes_value = ipv6_obj._ip.to_bytes(16, 'big')
-                    nibbles = []
-                    for byte in bytes_value:
-                        hex_byte = '{:02x}'.format(byte)
-                        for c in hex_byte:
-                            nibbles.append(c)
-                    reversed_nibbles = list(reversed(nibbles))
-                    ptr_domain = '.'.join(reversed_nibbles) + '.ip6.arpa.'
-                else:
-                    octets = address.split('.')
-                    subnet = '.'.join(octets[0:3])
-                    ptr_domain = '.'.join(reversed(octets)) + '.in-addr.arpa.'
+        # Get the host name if it is known or in DNS already
+        # If we have the hostname, we can skip the DNS lookup
+        if len(hostnames) == 0 or hostnames[0] in multihost_list:
+            for address in addresses:
+                # We query for the reverse PTR to get an additional hostnames
+                existing_hostnames = []
+                try:
+                    # Determine IP version and resolver
+                    ip_obj = ipaddress.ip_address(address)
+                    is_ipv6 = ip_obj.version == 6
+                    resolver = resolverObj6 if is_ipv6 else resolverObj4
+                    address_family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+                    record_type = 'AAAA' if is_ipv6 else 'A'
+                except ValueError as e:
+                    print(f"Invalid IP format: {address}")
+                    continue
+                try:
+                    if is_ipv6:
+                        subnet = address[0:19]
+                        ipv6_obj = ipaddress.IPv6Address(address)
+                        bytes_value = ipv6_obj._ip.to_bytes(16, 'big')
+                        nibbles = []
+                        for byte in bytes_value:
+                            hex_byte = '{:02x}'.format(byte)
+                            for c in hex_byte:
+                                nibbles.append(c)
+                        reversed_nibbles = list(reversed(nibbles))
+                        ptr_domain = '.'.join(reversed_nibbles) + '.ip6.arpa.'
+                    else:
+                        octets = address.split('.')
+                        subnet = '.'.join(octets[0:3])
+                        ptr_domain = '.'.join(reversed(octets)) + '.in-addr.arpa.'
 
-                response = resolver.resolve(ptr_domain, 'PTR', 'IN')
-                existing_fqdns = [rdata.target.to_text() for rdata in response]
-                existing_fqdns = [hostname.lower() for hostname in existing_fqdns if hostname.endswith(forward_zone)]
-                
-                for fqdn in existing_fqdns:
-                    fqdnsplit = fqdn.split('.')
-                    hostname = '.'.join(fqdnsplit[:-3])
-                    existing_hostnames.append(hostname)
-                if report_findings:
-                    print(f"Found {len(existing_hostnames)}: {', '.join(existing_hostnames)}")
-            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
-                if debug:
-                    print(f"Skipping {record_type} record for {address}")
-                    print(f"Error resolving {ptr_domain} PTR records: {e}")
-            except Exception as e:
-                if debug:
-                    print(f"Skipping {record_type} record for {address}")
-                    print(f"Error resolving {ptr_domain} PTR records: {e}")
-            # If we found any hostname in DNS, we add it here
-            if len(existing_hostnames) > 0:
-                existing_hostnames = list(set(existing_hostnames))
-                for existing_hostname in existing_hostnames:
-                    hostnames.append(existing_hostname)
-            hostnames = list(set(hostnames))
-            # Make Hostname to IP dictionary of lists
-            for hn in hostnames:
-                if hn in hostname_to_ips:
-                    hostname_to_ips[hn] = list(set(hostname_to_ips[hn] + [address]))
-                else:
-                    hostname_to_ips.setdefault(hn, [address])
-            # Make MAC to IP dictionary of lists
-            for mac in macs:
-                if mac in mac_to_ips:
-                    mac_to_ips[mac] = list(set(mac_to_ips[mac] + [address]))
-                else:
-                    mac_to_ips.setdefault(mac, [address])
-            # Find macs with ips with no hostname
-            for mac in macs:
+                    response = resolver.resolve(ptr_domain, 'PTR', 'IN')
+                    existing_fqdns = [rdata.target.to_text() for rdata in response]
+                    existing_fqdns = [hostname.lower() for hostname in existing_fqdns if hostname.endswith(forward_zone)]
+                    
+                    for fqdn in existing_fqdns:
+                        fqdnsplit = fqdn.split('.')
+                        hostname = '.'.join(fqdnsplit[:-3])
+                        existing_hostnames.append(hostname)
+                    if report_findings or len(existing_hostnames) > 1:
+                        print(f"{address} found {len(existing_hostnames)}: {', '.join(existing_hostnames)}")
+                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+                    if debug:
+                        print(f"Skipping {record_type} record for {address}")
+                        print(f"Error resolving {ptr_domain} PTR records: {e}")
+                except Exception as e:
+                    if debug:
+                        print(f"Skipping {record_type} record for {address}")
+                        print(f"Error resolving {ptr_domain} PTR records: {e}")
+                # If we found any hostname in DNS, we add it here
                 if len(existing_hostnames) > 0:
-                    if len(hostnames) == 0:
-                        mac_to_ips_with_no_hostname.setdefault(mac, [address])
-                        mac_to_ips_with_no_hostname[mac] = list(set(mac_to_ips_with_no_hostname[mac] + [address]))
+                    existing_hostnames = list(set(existing_hostnames))
+                    for existing_hostname in existing_hostnames:
+                        hostnames.append(existing_hostname)
+                hostnames = list(set(hostnames))
+                # Make Hostname to IP dictionary of lists
+                for hn in hostnames:
+                    if hn in hostname_to_ips:
+                        hostname_to_ips[hn] = list(set(hostname_to_ips[hn] + [address]))
+                    else:
+                        hostname_to_ips.setdefault(hn, [address])
+                # Make MAC to IP dictionary of lists
+                for mac in macs:
+                    if mac in mac_to_ips:
+                        mac_to_ips[mac] = list(set(mac_to_ips[mac] + [address]))
+                    else:
+                        mac_to_ips.setdefault(mac, [address])
+                # Find macs with ips with no hostname
+                for mac in macs:
+                    if len(existing_hostnames) > 0:
+                        if len(hostnames) == 0:
+                            mac_to_ips_with_no_hostname.setdefault(mac, [address])
+                            mac_to_ips_with_no_hostname[mac] = list(set(mac_to_ips_with_no_hostname[mac] + [address]))
+        else:
+            for hostname in hostnames:
+                for address in addresses:
+                    if hostname in hostname_to_ips:
+                        hostname_to_ips[hostname] = list(set(hostname_to_ips[hostname] + [address]))
+                    else:
+                        hostname_to_ips.setdefault(hostname, [address])
+                    for mac in macs:
+                        if mac in mac_to_ips:
+                            mac_to_ips[mac] = list(set(mac_to_ips[mac] + [address]))
+                        else:
+                            mac_to_ips.setdefault(mac, [address])
 
-    
     for hostname, host_ips in hostname_to_ips.items():
         for host_ip in host_ips:
             for mac, mac_ips in mac_to_ips.items():
                 if host_ip in mac_ips:
                     hostname_to_ips[hostname] = list(set(host_ips + mac_ips))
-
+    print(f"Processing DNS updates for {len(hostname_to_ips)} hostnames...")
     try:
-        pending_changes = create_dns_updates(hostname_to_ips)
-        debug = True
+        pending_changes = create_dns_updatesv2(hostname_to_ips)
+        debug = False
         if debug:
             print("DNS Updates:")
             print(pending_changes)
@@ -970,6 +1046,7 @@ def main():
                 number_of_changes += len(items)
 
         if number_of_changes > 0:
+            print("DNS updates created successfully...")
             # Send updates - UNCOMMENT TO EXECUTE
             if not debug:
                 response = tcp(fwd_update, dns_server)
@@ -984,10 +1061,13 @@ def main():
     except Exception as e:
         print(f"Error during DNS update: {e}")
 
-    pprint(hostname_to_ips)
+    if debug:
+        pprint(hostname_to_ips)
 
     for mac, ipaddresses in mac_to_ips_with_no_hostname.items():
         print(f"MAC: {mac} has no hostname at all - {','.join(ipaddresses)}")
-
+    redis_client.save()
+    redis_client.close()
+    print(f"Done.")
 if __name__ == "__main__":
     main()
