@@ -8,6 +8,7 @@ import ipaddress
 import socket
 import sys
 import time
+import pickle
 from dns.update import Update
 from dns.message import make_query
 from dns.query import tcp
@@ -49,6 +50,10 @@ multihost_list = config['Config']['MultiHostList'].split('\n')
 statichosts = config['Config']['StaticHosts'].split('\n')
 dns_subnets = config['Config']['Subnets'].split('\n')
 dns_reversezones = config['Config']['ReverseZones'].split('\n')
+token_file = "portainer_token.pkl"
+
+# Portainer Cookie
+portainer_jwt_token = None
 
 # Make reverse_zones lookup table
 reverse_zones = {}
@@ -150,13 +155,107 @@ def connect_to_redis():
             port=6379,
             db=6,
             password=seccache_redis_password,
-            decode_responses=True
+            decode_responses=True,
+            socket_connect_timeout=5
         )
         r.ping()  # Check connection
         return r
     except redis.exceptions.ConnectionError as e:
         print(f"Could not connect to Redis: {e}")
         return None
+
+def portainer_authenticate(username, password):
+    """Authenticates with Portainer and returns the JWT."""
+    auth_url = f"{portainer_url}/api/auth"
+    payload = {"Username": username, "Password": password}
+    response = requests.post(auth_url, json=payload)
+    response.raise_for_status()
+    return response.json()["jwt"]
+
+def portainer_save_token(token, filename):
+    """Saves the token and timestamp to a file."""
+    token_data = {"token": token, "timestamp": time.time()}
+    with open(filename, "wb") as f:
+        pickle.dump(token_data, f)
+
+def portainer_load_token(filename):
+    """Loads the token and timestamp from a file."""
+    try:
+        with open(filename, "rb") as f:
+            return pickle.load(f)
+    except FileNotFoundError:
+        return None
+
+def portainer_is_token_expired(timestamp, token_lifetime_seconds=8 * 3600):
+    """Checks if the token has expired."""
+    return time.time() - timestamp >= token_lifetime_seconds
+
+def all_systems_up(redis_client):
+    """
+    Checks if Redis, DNS server, OPNsense, and Portainer are all up and responding.
+    
+    Returns:
+        bool: True if all systems are responsive, False otherwise.
+    """
+    try:
+        # Check Redis connection
+        if not redis_client.ping():
+            return False
+        
+        # Check DNS server
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.nameservers = [dns_server]
+            resolver.timeout = 2
+            resolver.retry = 3
+            # Try to resolve a known domain
+            resolver.resolve('ns02.novalabs.home', 'A')
+        except Exception as e:
+            print(f"DNS server not responding: {e}")
+            return False
+        
+        # Check OPNsense web interface
+        try:
+            get_opnsense_data("/diagnostics/interface/get_arp")
+        except requests.exceptions.RequestException as e:
+            print(f"OPNsense not responding: {e}")
+            return False
+        
+        # Check Portainer web interface
+        try:
+            global portainer_jwt_token
+            token_data = portainer_load_token(token_file)
+            if token_data and not portainer_is_token_expired(token_data["timestamp"]):
+                portainer_jwt_token = token_data["token"]
+                print("Using saved token.")
+            else:
+                print("Authenticating to get a new token.")
+                try:
+                    portainer_jwt_token = portainer_authenticate(portainer_username, portainer_password)
+                    portainer_save_token(portainer_jwt_token, token_file)
+                    print("New token obtained and saved.")
+                except requests.exceptions.RequestException as e:
+                    print(f"Authentication failed: {e}")
+                    exit()
+            endpoints_url = f"{portainer_url}/api/endpoints?provisioned=true"
+            headers = {
+                "Authorization": f"Bearer {portainer_jwt_token}",
+                "Content-Type": "application/json"
+            }
+            response = requests.get(endpoints_url, headers=headers)
+            if response.status_code != 200:
+                print("Authentication failed")
+                return False
+        except requests.exceptions.RequestException as e:
+            print(f"Portainer not responding: {e}")
+            return False
+        
+        return True
+    
+    except Exception as e:
+        print(f"Unexpected error during system checks: {e}")
+        return False
+
 
 def get_opnsense_data(endpoint):
     """Fetches data from the OPNsense API."""
@@ -455,17 +554,27 @@ def process_interfaces(redis_client):
 
 def process_docker_containers(redis_client):
     # Step 1: Authenticate with Portainer
-    auth_url = f"{portainer_url}/api/auth"
-    auth_data = {'username': portainer_username, 'password': portainer_password}
-    response = requests.post(auth_url, json=auth_data)
-    if response.status_code != 200:
-        print("Authentication failed")
-        exit()
-    cookies = response.cookies
+    global portainer_jwt_token
+    token_data = portainer_load_token(token_file)
+    if token_data and not portainer_is_token_expired(token_data["timestamp"]):
+        portainer_jwt_token = token_data["token"]
+        print("Using saved token.")
+    else:
+        print("Authenticating to get a new token.")
+        try:
+            portainer_jwt_token = portainer_authenticate(portainer_username, portainer_password)
+            portainer_save_token(portainer_jwt_token, token_file)
+            print("New token obtained and saved.")
+        except requests.exceptions.RequestException as e:
+            print(f"Authentication failed: {e}")
+            exit()
     # Step 2: Retrieve List of Endpoints (Docker Hosts)
     endpoints_url = f"{portainer_url}/api/endpoints?provisioned=true"
-    headers = {'Content-Type': 'application/json'}
-    response = requests.get(endpoints_url, headers=headers, cookies=cookies)
+    headers = {
+        "Authorization": f"Bearer {portainer_jwt_token}",
+        "Content-Type": "application/json"
+    }
+    response = requests.get(endpoints_url, headers=headers)
     if response.status_code != 200:
         print("Failed to retrieve endpoints")
         exit()
@@ -482,7 +591,7 @@ def process_docker_containers(redis_client):
             print(f"Skipping inactive endpoint...")
             continue
         containers_url = f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json?all=true"
-        response = requests.get(containers_url, headers=headers, cookies=cookies)
+        response = requests.get(containers_url, headers=headers)
         if response.status_code != 200:
             print(f"Failed to retrieve containers from endpoint {endpoint_id}")
             #pprint(response.text)
@@ -496,7 +605,7 @@ def process_docker_containers(redis_client):
             container_id = container['Id']
             # Step 4: Retrieve Detailed Container Info
             container_info_url = f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/{container_id}/json"
-            response = requests.get(container_info_url, headers=headers, cookies=cookies)
+            response = requests.get(container_info_url, headers=headers)
             if response.status_code != 200:
                 print(f"Failed to get details for container {container_id}")
                 continue
@@ -772,6 +881,11 @@ def main():
         return
     print("Connected to Redis.")
 
+    print("Checking if all systems are up...")
+    if not all_systems_up(redis_client):
+        print("One or more systems are not responding. Exiting...")
+        return
+    print("All systems are up and running.")
     #list_of_keys = redis_client.keys("*")
     #for key in list_of_keys:
     #   redis_client.delete(key)
@@ -791,7 +905,9 @@ def main():
 
     print("Collecting Interface data...")
     process_interfaces(redis_client)
-
+    if not all_systems_up(redis_client):
+        print("One or more systems are not responding. Exiting...")
+        return
     print("Collecting Docker Container data...")
     process_docker_containers(redis_client)
 
@@ -825,8 +941,12 @@ def main():
         for address in record['address']:
             redis_key_address = f"static:address:{address}"
             update_redis_entry(redis_client, redis_key_address, record)
+    redis_client.save()
+    time.sleep(2)
     print("Data collection complete.")
-
+    if not all_systems_up(redis_client):
+        print("One or more systems are not responding. Exiting...")
+        return
     debug = False
     check_data = False
     if check_data:
@@ -841,7 +961,9 @@ def main():
                     output_count+=1
 
         pprint(slimmed_cached_data)
-
+    if not all_systems_up(redis_client):
+        print("One or more systems are not responding. Exiting...")
+        return
     # Clean up stale records
     print("Cleaning up stale records...")
     for pattern in KEY_PATTERNS:
@@ -906,7 +1028,9 @@ def main():
                 redis_client.save()
                 time.sleep(2)
     #sys.exit(0)
-    
+    if not all_systems_up(redis_client):
+        print("One or more systems are not responding. Exiting...")
+        return
     # Assuming get_data_from_redis is already defined and available
     all_data = []
     for pattern in KEY_PATTERNS:
@@ -1032,6 +1156,9 @@ def main():
             for mac, mac_ips in mac_to_ips.items():
                 if host_ip in mac_ips:
                     hostname_to_ips[hostname] = list(set(host_ips + mac_ips))
+    if not all_systems_up(redis_client):
+        print("One or more systems are not responding. Exiting...")
+        return
     print(f"Processing DNS updates for {len(hostname_to_ips)} hostnames...")
     try:
         pending_changes = create_dns_updatesv2(hostname_to_ips)
@@ -1049,11 +1176,17 @@ def main():
             print("DNS updates created successfully...")
             # Send updates - UNCOMMENT TO EXECUTE
             if not debug:
+                if not all_systems_up(redis_client):
+                    print("One or more systems are not responding. Exiting...")
+                    return
                 response = tcp(fwd_update, dns_server)
                 print(f"Forward update response: {response.rcode()}")
 
             if not debug:
                 for subnet, ptr_update in ptr_updates.items():
+                    if not all_systems_up(redis_client):
+                        print("One or more systems are not responding. Exiting...")
+                        return
                     response = tcp(ptr_update, dns_server)
                     print(f"Reverse update response for {subnet}: {response.rcode()}")
         else:
