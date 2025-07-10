@@ -50,6 +50,7 @@ multihost_list = config['Config']['MultiHostList'].split('\n')
 statichosts = config['Config']['StaticHosts'].split('\n')
 dns_subnets = config['Config']['Subnets'].split('\n')
 dns_reversezones = config['Config']['ReverseZones'].split('\n')
+bad_hostnames = config['Config']['BadHostnames'].split('\n')
 token_file = "portainer_token.pkl"
 
 # Portainer Cookie
@@ -227,8 +228,20 @@ def all_systems_up(redis_client):
             token_data = portainer_load_token(token_file)
             if token_data and not portainer_is_token_expired(token_data["timestamp"]):
                 portainer_jwt_token = token_data["token"]
-                print("Using saved token.")
-            else:
+                endpoints_url = f"{portainer_url}/api/endpoints?provisioned=true"
+                headers = {
+                    "Authorization": f"Bearer {portainer_jwt_token}",
+                    "Content-Type": "application/json"
+                }
+                response = requests.get(endpoints_url, headers=headers)
+                if response.status_code != 200:
+                    print("Authentication failed - token failed or expired")
+                    token_data = None
+                    portainer_jwt_token = None
+                else:
+                    pass
+                    #print("Using saved token.")
+            if not portainer_jwt_token:
                 print("Authenticating to get a new token.")
                 try:
                     portainer_jwt_token = portainer_authenticate(portainer_username, portainer_password)
@@ -246,6 +259,38 @@ def all_systems_up(redis_client):
             if response.status_code != 200:
                 print("Authentication failed")
                 return False
+            endpoints_url = f"{portainer_url}/api/endpoints?provisioned=true"
+            headers = {
+                "Authorization": f"Bearer {portainer_jwt_token}",
+                "Content-Type": "application/json"
+            }
+            response = requests.get(endpoints_url, headers=headers)
+            if response.status_code != 200:
+                print("Failed to retrieve endpoints")
+                exit()
+            endpoints = response.json()
+            container_list = []
+            # Step 3: Iterate Over Endpoints and Containers
+            for endpoint in endpoints:
+                endpoint_id = endpoint['Id']
+                endpoint_status = endpoint['Status']
+                #print(f"Looking into {endpoint['Name']} with status {endpoint_status}...")
+                if endpoint_status != 1:
+                    #print(f"Skipping inactive endpoint...")
+                    continue
+                if 'Snapshots' not in endpoint or not endpoint['Snapshots']:
+                    print(f"No Docker Snapshots found for endpoint {endpoint_id}")
+                    print("Exiting...")
+                    return False
+                if 'DockerSnapshotRaw' not in endpoint['Snapshots'][0]:
+                    print(f"No DockerSnapshotRaw found in endpoint {endpoint_id}")
+                    print("Exiting...")
+                    return False
+                if not endpoint['Snapshots'][0]['DockerSnapshotRaw'].get('Containers'):
+                    print(f"No Docker Containers found in endpoint {endpoint_id}")
+                    pprint(endpoint['Snapshots'])
+                    print("Exiting...")
+                    return False
         except requests.exceptions.RequestException as e:
             print(f"Portainer not responding: {e}")
             return False
@@ -404,11 +449,13 @@ def process_arp(redis_client):
             if address.startswith(ipv4_subnetfilter):
                 mac = arp_entry.get("mac")
                 mac = mac.lower()
-                hostname = arp_entry.get("hostname")
-                hostname = hostname.lower() if hostname else None
+                # Unreliable hostname retrieval from ARP, so we set it to None
+                hostname = None
+                #hostname = arp_entry.get("hostname")
+                #hostname = hostname.lower() if hostname else None
                 redis_key_mac = f"arp:mac:{mac}"
                 redis_key_address = f"arp:address:{ipaddress.IPv4Address(address)}"
-                redis_key_hostname = f"arp:hostname:{hostname}"
+                #redis_key_hostname = f"arp:hostname:{hostname}"
                 arp_entry["mac"] = [mac] if mac else []
                 arp_entry["address"] = [address] if address else []
                 arp_entry["address"] = [ f"{ipaddress.IPv4Address(address)}" for address in arp_entry["address"] if address.startswith(ipv4_subnetfilter) ]
@@ -417,8 +464,8 @@ def process_arp(redis_client):
                     update_redis_entry(redis_client, redis_key_mac, arp_entry)
                 if address:
                     update_redis_entry(redis_client, redis_key_address, arp_entry)
-                if hostname:
-                    update_redis_entry(redis_client, redis_key_hostname, arp_entry)
+                #if hostname:
+                #    update_redis_entry(redis_client, redis_key_hostname, arp_entry)
             else:
                 if debug:
                     print(f"Skipped...")
@@ -438,11 +485,13 @@ def process_ndp(redis_client):
             if address.startswith(ipv6_subnetfilter):
                 mac = ndp_entry.get("mac")
                 mac = mac.lower()
-                hostname = ndp_entry.get("hostname")
-                hostname = hostname.lower() if hostname else None
+                # Unreliable hostname retrieval from NDP, so we set it to None
+                hostname = None
+                #hostname = ndp_entry.get("hostname")
+                #hostname = hostname.lower() if hostname else None
                 redis_key_mac = f"ndp:mac:{mac}"
                 redis_key_address = f"ndp:address:{ipaddress.IPv6Address(address)}"
-                redis_key_hostname = f"ndp:hostname:{hostname}"
+                #redis_key_hostname = f"ndp:hostname:{hostname}"
                 ndp_entry["mac"] = [mac] if mac else []
                 ndp_entry["address"] = [address] if address else []
                 ndp_entry["address"] = [ f"{ipaddress.IPv6Address(address)}" for address in ndp_entry["address"] if address.startswith(ipv6_subnetfilter) ]
@@ -451,8 +500,8 @@ def process_ndp(redis_client):
                     update_redis_entry(redis_client, redis_key_mac, ndp_entry)
                 if address:
                     update_redis_entry(redis_client, redis_key_address, ndp_entry)
-                if hostname:
-                    update_redis_entry(redis_client, redis_key_hostname, ndp_entry)
+                #if hostname:
+                #    update_redis_entry(redis_client, redis_key_hostname, ndp_entry)
             else:
                 if debug:
                     print(f"Skipped...")
@@ -558,8 +607,19 @@ def process_docker_containers(redis_client):
     token_data = portainer_load_token(token_file)
     if token_data and not portainer_is_token_expired(token_data["timestamp"]):
         portainer_jwt_token = token_data["token"]
-        print("Using saved token.")
-    else:
+        endpoints_url = f"{portainer_url}/api/endpoints?provisioned=true"
+        headers = {
+            "Authorization": f"Bearer {portainer_jwt_token}",
+            "Content-Type": "application/json"
+        }
+        response = requests.get(endpoints_url, headers=headers)
+        if response.status_code != 200:
+            print("Authentication failed - token failed or expired")
+            token_data = None
+            portainer_jwt_token = None
+        else:
+            print("Using saved token.")
+    if not portainer_jwt_token:
         print("Authenticating to get a new token.")
         try:
             portainer_jwt_token = portainer_authenticate(portainer_username, portainer_password)
@@ -586,10 +646,21 @@ def process_docker_containers(redis_client):
         endpoint_id = endpoint['Id']
         endpoint_status = endpoint['Status']
         print(f"Looking into {endpoint['Name']} with status {endpoint_status}...")
-        print(f"Which has {len(endpoint['Snapshots'][0]['DockerSnapshotRaw']['Containers'])} Docker Snapshots Container Definitions")
         if endpoint_status != 1:
             print(f"Skipping inactive endpoint...")
             continue
+        if 'Snapshots' not in endpoint or not endpoint['Snapshots']:
+            print(f"No Docker Snapshots found for endpoint {endpoint_id}")
+            continue
+        if 'DockerSnapshotRaw' not in endpoint['Snapshots'][0]:
+            print(f"No DockerSnapshotRaw found in endpoint {endpoint_id}")
+            continue
+        if not endpoint['Snapshots'][0]['DockerSnapshotRaw'].get('Containers'):
+            print(f"No Docker Containers found in endpoint {endpoint_id}")
+            pprint(endpoint['Snapshots'])
+            print("Exiting...")
+            sys.exit(0)
+        print(f"Which has {len(endpoint['Snapshots'][0]['DockerSnapshotRaw']['Containers'])} Docker Snapshots Container Definitions")
         containers_url = f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json?all=true"
         response = requests.get(containers_url, headers=headers)
         if response.status_code != 200:
@@ -965,6 +1036,25 @@ def main():
         print("One or more systems are not responding. Exiting...")
         return
     # Clean up stale records
+    print("Cleaning up problematic records...")
+    for pattern in KEY_PATTERNS:
+        cached_data = get_all_data_from_redis(redis_client, pattern)
+        for k, v in cached_data.items():
+            for key, value in v.items():
+                if key == 'hostname':
+                    for badhostname in bad_hostnames:
+                        if badhostname in value:
+                            print(f"Cleaning up problematic hostname '{badhostname}' in {k}")
+                            v['hostname'] = [h for h in value if h != badhostname]
+                            if len(v['hostname']) == 0:
+                                print(f"Removing {k} as no hostnames remain")
+                                redis_client.delete(k)
+                                continue
+                            else:
+                                # Update the record with cleaned hostname
+                                print(f"Updating {k} with cleaned hostname")
+                                redis_client.set(k, json.dumps(v))
+    redis_client.save()
     print("Cleaning up stale records...")
     for pattern in KEY_PATTERNS:
         cached_data = get_all_data_from_redis(redis_client, pattern)
@@ -1099,7 +1189,9 @@ def main():
                     response = resolver.resolve(ptr_domain, 'PTR', 'IN')
                     existing_fqdns = [rdata.target.to_text() for rdata in response]
                     existing_fqdns = [hostname.lower() for hostname in existing_fqdns if hostname.endswith(forward_zone)]
-                    
+                    # First attempt to not propigate bad hostnames
+                    for badhostname in bad_hostnames:
+                        existing_fqdns = [hostname for hostname in existing_fqdns if not hostname.startswith(badhostname)]
                     for fqdn in existing_fqdns:
                         fqdnsplit = fqdn.split('.')
                         hostname = '.'.join(fqdnsplit[:-3])
