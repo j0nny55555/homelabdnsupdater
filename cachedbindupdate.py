@@ -53,6 +53,16 @@ dns_reversezones = config['Config']['ReverseZones'].split('\n')
 bad_hostnames = config['Config']['BadHostnames'].split('\n')
 token_file = "portainer_token.pkl"
 
+# Holds the key of the main host w/mac and the value is the list of hosted hosts
+sharedhosts_primary_dict = {}
+# Holds the key each hosted host with the value being the main host that hosts it
+sharedhosts_secondary_dict = {}
+for hosts_line in multihost_list:
+    hosts_split = hosts_line.split('/')
+    sharedhosts_primary_dict.setdefault(hosts_split[0], hosts_split[1:])
+    for secondary_host in sharedhosts_primary_dict[hosts_split[0]]:
+        sharedhosts_secondary_dict.setdefault(secondary_host, hosts_split[0])
+
 # Portainer Cookie
 portainer_jwt_token = None
 
@@ -952,6 +962,30 @@ def main():
         return
     print("Connected to Redis.")
 
+    print("Cleaning up problematic records...")
+    for pattern in KEY_PATTERNS:
+        cached_data = get_all_data_from_redis(redis_client, pattern)
+        for k, v in cached_data.items():
+            for key, value in v.items():
+                if key == 'hostname':
+                    for badhostname in bad_hostnames:
+                        if badhostname in value:
+                            print(f"Cleaning up problematic hostname '{badhostname}' in {k}")
+                            v['hostname'] = [h for h in value if h != badhostname]
+                            if len(v['hostname']) == 0:
+                                print(f"Removing {k} as no hostnames remain")
+                                redis_client.delete(k)
+                                continue
+                            else:
+                                # Update the record with cleaned hostname
+                                print(f"Updating {k} with cleaned hostname")
+                                redis_client.set(k, json.dumps(v))
+                            # to_delete_macs = v['macs']
+                            # to_delete_ips = v['addresses']
+                            # for delete_mac in to_delete_macs:
+                            #     redis_client.delete
+    redis_client.save()
+
     print("Checking if all systems are up...")
     if not all_systems_up(redis_client):
         print("One or more systems are not responding. Exiting...")
@@ -1036,25 +1070,6 @@ def main():
         print("One or more systems are not responding. Exiting...")
         return
     # Clean up stale records
-    print("Cleaning up problematic records...")
-    for pattern in KEY_PATTERNS:
-        cached_data = get_all_data_from_redis(redis_client, pattern)
-        for k, v in cached_data.items():
-            for key, value in v.items():
-                if key == 'hostname':
-                    for badhostname in bad_hostnames:
-                        if badhostname in value:
-                            print(f"Cleaning up problematic hostname '{badhostname}' in {k}")
-                            v['hostname'] = [h for h in value if h != badhostname]
-                            if len(v['hostname']) == 0:
-                                print(f"Removing {k} as no hostnames remain")
-                                redis_client.delete(k)
-                                continue
-                            else:
-                                # Update the record with cleaned hostname
-                                print(f"Updating {k} with cleaned hostname")
-                                redis_client.set(k, json.dumps(v))
-    redis_client.save()
     print("Cleaning up stale records...")
     for pattern in KEY_PATTERNS:
         cached_data = get_all_data_from_redis(redis_client, pattern)
@@ -1144,6 +1159,8 @@ def main():
     print("Data cleanup complete.")
     #pprint(all_data)
     #sys.exit(0)
+    do_fill_in = False
+    
     print("Creating hostname to IP and MAC to IP from Redis data and DNS lookups...")
     mac_to_ips = {}
     hostname_to_ips = {}
@@ -1155,63 +1172,67 @@ def main():
         hostnames = value_dict.get('hostname', [])
         # Get the host name if it is known or in DNS already
         # If we have the hostname, we can skip the DNS lookup
-        if len(hostnames) == 0 or hostnames[0] in multihost_list:
+        if len(hostnames) == 0 or hostnames[0] in sharedhosts_secondary_dict.keys():
             for address in addresses:
                 # We query for the reverse PTR to get an additional hostnames
                 existing_hostnames = []
-                try:
-                    # Determine IP version and resolver
-                    ip_obj = ipaddress.ip_address(address)
-                    is_ipv6 = ip_obj.version == 6
-                    resolver = resolverObj6 if is_ipv6 else resolverObj4
-                    address_family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-                    record_type = 'AAAA' if is_ipv6 else 'A'
-                except ValueError as e:
-                    print(f"Invalid IP format: {address}")
-                    continue
-                try:
-                    if is_ipv6:
-                        subnet = address[0:19]
-                        ipv6_obj = ipaddress.IPv6Address(address)
-                        bytes_value = ipv6_obj._ip.to_bytes(16, 'big')
-                        nibbles = []
-                        for byte in bytes_value:
-                            hex_byte = '{:02x}'.format(byte)
-                            for c in hex_byte:
-                                nibbles.append(c)
-                        reversed_nibbles = list(reversed(nibbles))
-                        ptr_domain = '.'.join(reversed_nibbles) + '.ip6.arpa.'
-                    else:
-                        octets = address.split('.')
-                        subnet = '.'.join(octets[0:3])
-                        ptr_domain = '.'.join(reversed(octets)) + '.in-addr.arpa.'
+                if do_fill_in:
+                    try:
+                        # Determine IP version and resolver
+                        ip_obj = ipaddress.ip_address(address)
+                        is_ipv6 = ip_obj.version == 6
+                        resolver = resolverObj6 if is_ipv6 else resolverObj4
+                        address_family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+                        record_type = 'AAAA' if is_ipv6 else 'A'
+                    except ValueError as e:
+                        print(f"Invalid IP format: {address}")
+                        continue
+                    try:
+                        if is_ipv6:
+                            subnet = address[0:19]
+                            ipv6_obj = ipaddress.IPv6Address(address)
+                            bytes_value = ipv6_obj._ip.to_bytes(16, 'big')
+                            nibbles = []
+                            for byte in bytes_value:
+                                hex_byte = '{:02x}'.format(byte)
+                                for c in hex_byte:
+                                    nibbles.append(c)
+                            reversed_nibbles = list(reversed(nibbles))
+                            ptr_domain = '.'.join(reversed_nibbles) + '.ip6.arpa.'
+                        else:
+                            octets = address.split('.')
+                            subnet = '.'.join(octets[0:3])
+                            ptr_domain = '.'.join(reversed(octets)) + '.in-addr.arpa.'
 
-                    response = resolver.resolve(ptr_domain, 'PTR', 'IN')
-                    existing_fqdns = [rdata.target.to_text() for rdata in response]
-                    existing_fqdns = [hostname.lower() for hostname in existing_fqdns if hostname.endswith(forward_zone)]
-                    # First attempt to not propigate bad hostnames
-                    for badhostname in bad_hostnames:
-                        existing_fqdns = [hostname for hostname in existing_fqdns if not hostname.startswith(badhostname)]
-                    for fqdn in existing_fqdns:
-                        fqdnsplit = fqdn.split('.')
-                        hostname = '.'.join(fqdnsplit[:-3])
-                        existing_hostnames.append(hostname)
-                    if report_findings or len(existing_hostnames) > 1:
-                        print(f"{address} found {len(existing_hostnames)}: {', '.join(existing_hostnames)}")
-                except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
-                    if debug:
-                        print(f"Skipping {record_type} record for {address}")
-                        print(f"Error resolving {ptr_domain} PTR records: {e}")
-                except Exception as e:
-                    if debug:
-                        print(f"Skipping {record_type} record for {address}")
-                        print(f"Error resolving {ptr_domain} PTR records: {e}")
+                        response = resolver.resolve(ptr_domain, 'PTR', 'IN')
+                        existing_fqdns = [rdata.target.to_text() for rdata in response]
+                        existing_fqdns = [hostname.lower() for hostname in existing_fqdns if hostname.endswith(forward_zone)]
+                        # First attempt to not propigate bad hostnames
+                        for badhostname in bad_hostnames:
+                            existing_fqdns = [hostname for hostname in existing_fqdns if not hostname.startswith(badhostname)]
+                        for fqdn in existing_fqdns:
+                            fqdnsplit = fqdn.split('.')
+                            hostname = '.'.join(fqdnsplit[:-3])
+                            existing_hostnames.append(hostname)
+                        if report_findings or len(existing_hostnames) > 1:
+                            print(f"{address} found {len(existing_hostnames)}: {', '.join(existing_hostnames)}")
+                    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+                        if debug:
+                            print(f"Skipping {record_type} record for {address}")
+                            print(f"Error resolving {ptr_domain} PTR records: {e}")
+                    except Exception as e:
+                        if debug:
+                            print(f"Skipping {record_type} record for {address}")
+                            print(f"Error resolving {ptr_domain} PTR records: {e}")
                 # If we found any hostname in DNS, we add it here
                 if len(existing_hostnames) > 0:
                     existing_hostnames = list(set(existing_hostnames))
                     for existing_hostname in existing_hostnames:
                         hostnames.append(existing_hostname)
-                hostnames = list(set(hostnames))
+                if len(hostnames) > 0 and hostnames[0] in sharedhosts_secondary_dict.keys():
+                    hostnames = list(set(hostnames + sharedhosts_primary_dict[sharedhosts_secondary_dict[hostnames[0]]]))
+                else:
+                    hostnames = list(set(hostnames))
                 # Make Hostname to IP dictionary of lists
                 for hn in hostnames:
                     if hn in hostname_to_ips:
