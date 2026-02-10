@@ -39,6 +39,10 @@ key_secret_update = config['DNS']['KeySecretUpdate']
 portainer_url = config['Portainer']['URL']
 portainer_username = config['Portainer']['Username']
 portainer_password = config['Portainer']['Password']
+keep_cache = config['Config']['KeepCache']
+debug = config['Config']['Debug']
+debugLog = config['Config']['DebugLog']
+report_findings = config['Config']['ReportFindings']
 forward_zone = config['Config']['ForwardZone']
 dns_domain = config['Config']['DNSDomain']
 ipv4_resolver = config['Config']['IPv4Resolver']
@@ -51,7 +55,28 @@ statichosts = config['Config']['StaticHosts'].split('\n')
 dns_subnets = config['Config']['Subnets'].split('\n')
 dns_reversezones = config['Config']['ReverseZones'].split('\n')
 bad_hostnames = config['Config']['BadHostnames'].split('\n')
+bad_addresses = config['Config']['BadAddresses'].split('\n')
 token_file = "portainer_token.pkl"
+
+if keep_cache == 'False':
+    keep_cache = False
+else:
+    keep_cache = True
+if debug == 'False':
+    debug = False
+else:
+    debug = True
+if debugLog == 'False':
+    debugLog = False
+else:
+    debugLog = True
+if report_findings == 'False':
+    report_findings = False
+else:
+    report_findings = True
+
+starttime = datetime.now()
+log_data = []
 
 # Holds the key of the main host w/mac and the value is the list of hosted hosts
 sharedhosts_primary_dict = {}
@@ -109,9 +134,6 @@ routerAPI = requests.session()
 routerAPI.auth = (api_key, secret_key)
 routerAPI.verify = False
 
-debug = False
-report_findings = False
-
 # Initialize resolvers
 resolverObj4 = dns.resolver.Resolver()
 resolverObj4.nameservers = [ipv4_resolver]
@@ -148,23 +170,19 @@ KEY_PATTERNS = [
     'static:hostname:*',
 ]
 
-########################################################################
-# Note: 'manual_hostname_to_mac' dictionary
-# Once we added the Portainer collection this did not become necessary
-# It is left here so you can use that if you need to in the meantime
-########################################################################
-# manual_hostname_to_mac = {
-#     'hostname': ['macaddress','ipaddress']
-# }
+def logdatamessage(message):
+    if debugLog:
+        print(message)
+    log_data.append(message)
 
-def connect_to_redis():
+def connect_to_redis(rdb):
     """Connects to the Redis database."""
     try:
         # Initialize Redis connection
         r = redis.Redis(
             host=seccache_redis_host,
             port=6379,
-            db=6,
+            db=rdb,
             password=seccache_redis_password,
             decode_responses=True,
             socket_connect_timeout=5
@@ -252,23 +270,14 @@ def all_systems_up(redis_client):
                     pass
                     #print("Using saved token.")
             if not portainer_jwt_token:
-                print("Authenticating to get a new token.")
+                logdatamessage("Authenticating to get a new token.")
                 try:
                     portainer_jwt_token = portainer_authenticate(portainer_username, portainer_password)
                     portainer_save_token(portainer_jwt_token, token_file)
-                    print("New token obtained and saved.")
+                    logdatamessage("New token obtained and saved.")
                 except requests.exceptions.RequestException as e:
                     print(f"Authentication failed: {e}")
                     exit()
-            endpoints_url = f"{portainer_url}/api/endpoints?provisioned=true"
-            headers = {
-                "Authorization": f"Bearer {portainer_jwt_token}",
-                "Content-Type": "application/json"
-            }
-            response = requests.get(endpoints_url, headers=headers)
-            if response.status_code != 200:
-                print("Authentication failed")
-                return False
             endpoints_url = f"{portainer_url}/api/endpoints?provisioned=true"
             headers = {
                 "Authorization": f"Bearer {portainer_jwt_token}",
@@ -288,19 +297,40 @@ def all_systems_up(redis_client):
                 if endpoint_status != 1:
                     #print(f"Skipping inactive endpoint...")
                     continue
-                if 'Snapshots' not in endpoint or not endpoint['Snapshots']:
-                    print(f"No Docker Snapshots found for endpoint {endpoint_id}")
-                    print("Exiting...")
-                    return False
-                if 'DockerSnapshotRaw' not in endpoint['Snapshots'][0]:
-                    print(f"No DockerSnapshotRaw found in endpoint {endpoint_id}")
-                    print("Exiting...")
-                    return False
-                if not endpoint['Snapshots'][0]['DockerSnapshotRaw'].get('Containers'):
-                    print(f"No Docker Containers found in endpoint {endpoint_id}")
-                    pprint(endpoint['Snapshots'])
-                    print("Exiting...")
-                    return False
+                containers_url = f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json?all=true"
+                headers = {
+                    "Authorization": f"Bearer {portainer_jwt_token}",
+                    "Content-Type": "application/json"
+                }
+                response = requests.get(containers_url, headers=headers)
+                if response.status_code != 200:
+                    print(f"Failed to retrieve endpoints - {containers_url}")
+                    #pprint(response.json())
+                    #pprint(container_list)
+                    #exit()
+                containers = response.json()
+                if len(containers) == 0:
+                    print(f"Endpoint {endpoint_id} has 0 containers...")
+                    continue
+                else:
+                    container_list.append(containers)
+                # if 'Snapshots' not in endpoint or not endpoint['Snapshots']:
+                #     logdatamessage(f"No Docker Snapshots found for endpoint {endpoint_id}")
+                #     logdatamessage("Exiting...")
+                #     return False
+                # #if 'ContainerCount' in endpoint['Snapshots'][0] and endpoint['Snapshots'][0]['ContainerCount'] > 0:
+                # #    return True
+                # if 'DockerSnapshotRaw' not in endpoint['Snapshots'][0]:
+                #     logdatamessage(f"No DockerSnapshotRaw found in endpoint {endpoint_id}")
+                #     logdatamessage("Exiting...")
+                #     return False
+                # if not endpoint['Snapshots'][0]['DockerSnapshotRaw'].get('Containers'):
+                #     logdatamessage(f"No Docker Containers found in endpoint {endpoint_id}")
+                #     pprint(endpoint)
+                #     logdatamessage("Exiting...")
+                #     return False
+            if len(container_list) == 0:
+                return False
         except requests.exceptions.RequestException as e:
             print(f"Portainer not responding: {e}")
             return False
@@ -319,6 +349,7 @@ def get_opnsense_data(endpoint):
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         return response.json()
     except requests.exceptions.RequestException as e:
+        print(f"{base_url}{endpoint}")
         print(f"Error fetching data from {endpoint}: {e}")
         return None
 
@@ -331,11 +362,11 @@ def get_data_from_redis(redis_client, pattern):
             valueraw = redis_client.get(key)
             if valueraw:
                 value = json.loads(valueraw)
-            if datetime.strptime(value['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=1) > datetime.now():
-                data[key] = value
-            else:
-                if debug:
-                    print(f"Not using aged {data[key]['last_seen']} Redis data... {key}")
+                if datetime.strptime(value['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=1) > datetime.now():
+                    data[key] = value
+                else:
+                    if debug:
+                        print(f"Not using aged {value['last_seen']} Redis data... {key}")
         except (json.JSONDecodeError, TypeError) as e:
             print(f"Error decoding JSON for key {key}: {e}")
     return data
@@ -354,27 +385,19 @@ def get_all_data_from_redis(redis_client, pattern):
             print(f"Error decoding JSON for key {key}: {e}")
     return data
 
-def update_redis_entry(redis_client, key, new_data):
+def update_redis_entryv2(redis_client, key, new_data, keep_cache, cache_list):
     """Updates an existing Redis entry with new data."""
     new_data["last_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    ########################################################################
-    # There used to be a 'manual_hostname_to_mac' dictionary
-    # Once we added the Portainer collection this did not become necessary
-    # It is left here so you can use that if you need to in the meantime
-    ########################################################################
-    # for manual_hostname, manual_mac_ip in manual_hostname_to_mac.items():
-    #     manual_mac = manual_mac_ip[0]
-    #     manual_address = manual_mac_ip[1]
-    #     if manual_mac in new_data['mac']:
-    #         new_data['hostname'] = list(set(new_data['hostname'] + [manual_hostname]))
-    #         new_data['address'] = list(set(new_data['address'] + [manual_address]))
-    #         print(f"Manual Hostname to Mac update... {manual_hostname} - {manual_mac} - {manual_address}")
-    entryRaw = redis_client.get(key)
-    entry = json.loads(entryRaw) if entryRaw else {}
+    if keep_cache:
+        entryRaw = redis_client.get(key)
+        entry = json.loads(entryRaw) if entryRaw else {}
+    else:
+        entry = {}
     if entry:
         # Update existing entry with new data
         for k, v in new_data.items():
-            if isinstance(entry.get(k), list):
+            if isinstance(entry.get(k), list) and k in cache_list:
+                # addresses can only have one mac, but a mac can have more than one address
                 entry[k] = list(set(entry[k] + v)) if v else list(set(entry[k]))
             else:
                 entry[k] = v
@@ -471,18 +494,18 @@ def process_arp(redis_client):
                 arp_entry["address"] = [ f"{ipaddress.IPv4Address(address)}" for address in arp_entry["address"] if address.startswith(ipv4_subnetfilter) ]
                 arp_entry["hostname"] = [hostname] if hostname else []
                 if mac:
-                    update_redis_entry(redis_client, redis_key_mac, arp_entry)
+                    update_redis_entryv2(redis_client, redis_key_mac, arp_entry, keep_cache, ['address','hostname'])
                 if address:
-                    update_redis_entry(redis_client, redis_key_address, arp_entry)
+                    update_redis_entryv2(redis_client, redis_key_address, arp_entry, keep_cache, ['hostname'])
                 #if hostname:
-                #    update_redis_entry(redis_client, redis_key_hostname, arp_entry)
+                #    update_redis_entryv2(redis_client, redis_key_hostname, arp_entry, keep_cache, ['mac', 'address'])
             else:
                 if debug:
                     print(f"Skipped...")
                     pprint(arp_entry)
-        print(f"ARP entries pulled: {len(data)}")
+        logdatamessage(f"ARP entries pulled: {len(data)}")
     list_of_arp_keys = redis_client.keys("arp:*")
-    print(f"ARP keys in Redis: {len(list_of_arp_keys)}")
+    logdatamessage(f"ARP keys in Redis: {len(list_of_arp_keys)}")
 
 def process_ndp(redis_client):
     """Collects and stores NDP data in Redis."""
@@ -507,18 +530,18 @@ def process_ndp(redis_client):
                 ndp_entry["address"] = [ f"{ipaddress.IPv6Address(address)}" for address in ndp_entry["address"] if address.startswith(ipv6_subnetfilter) ]
                 ndp_entry["hostname"] = [hostname] if hostname else []
                 if mac:
-                    update_redis_entry(redis_client, redis_key_mac, ndp_entry)
+                    update_redis_entryv2(redis_client, redis_key_mac, ndp_entry, keep_cache, ['address','hostname'])
                 if address:
-                    update_redis_entry(redis_client, redis_key_address, ndp_entry)
+                    update_redis_entryv2(redis_client, redis_key_address, ndp_entry, keep_cache, ['hostname'])
                 #if hostname:
-                #    update_redis_entry(redis_client, redis_key_hostname, ndp_entry)
+                #    update_redis_entryv2(redis_client, redis_key_hostname, ndp_entry, keep_cache, ['mac', 'address'])
             else:
                 if debug:
                     print(f"Skipped...")
                     pprint(ndp_entry)
-        print(f"NDP entries pulled: {len(data)}")
+        logdatamessage(f"NDP entries pulled: {len(data)}")
     list_of_ndp_keys = redis_client.keys("ndp:*")
-    print(f"NDP keys in Redis: {len(list_of_ndp_keys)}")
+    logdatamessage(f"NDP keys in Redis: {len(list_of_ndp_keys)}")
 
 def process_dhcpv4(redis_client):
     """Collects and stores DHCPv4 data in Redis."""
@@ -527,7 +550,7 @@ def process_dhcpv4(redis_client):
         if debug:
             pprint(data['rows'][0:5])
         for dhcpv4_entry in data['rows']:
-            address = f"{ipaddress.IPv4Address(dhcpv4_entry.get("address"))}"
+            address = f"{ipaddress.IPv4Address(dhcpv4_entry.get('address'))}"
             mac = dhcpv4_entry.get("mac")
             mac = mac.lower()
             hostname = dhcpv4_entry.get("hostname")
@@ -539,14 +562,14 @@ def process_dhcpv4(redis_client):
             dhcpv4_entry["address"] = [address] if address else []
             dhcpv4_entry["hostname"] = [hostname] if hostname else []
             if mac:
-                update_redis_entry(redis_client, redis_key_mac, dhcpv4_entry)
+                update_redis_entryv2(redis_client, redis_key_mac, dhcpv4_entry, keep_cache, ['address','hostname'])
             if address:
-                update_redis_entry(redis_client, redis_key_address, dhcpv4_entry)
+                update_redis_entryv2(redis_client, redis_key_address, dhcpv4_entry, keep_cache, ['hostname'])
             if hostname:
-                update_redis_entry(redis_client, redis_key_hostname, dhcpv4_entry)
-        print(f"DHCPv4 entrys pulled: {len(data['rows'])}")
+                update_redis_entryv2(redis_client, redis_key_hostname, dhcpv4_entry, keep_cache, ['mac', 'address'])
+        logdatamessage(f"ISC DHCPv4 entrys pulled: {len(data['rows'])}")
     list_of_dhcpv4_keys = redis_client.keys("dhcpv4:*")
-    print(f"DHCPv4 keys in Redis: {len(list_of_dhcpv4_keys)}")
+    logdatamessage(f"ISC DHCPv4 keys in Redis: {len(list_of_dhcpv4_keys)}")
 
 def process_dhcpv6(redis_client):
     """Collects and stores DHCPv6 data in Redis."""
@@ -555,7 +578,7 @@ def process_dhcpv6(redis_client):
         if debug:
             pprint(data['rows'][0:5])
         for dhcpv6_entry in data['rows']:
-            address = f"{ipaddress.IPv6Address(dhcpv6_entry.get("address"))}"
+            address = f"{ipaddress.IPv6Address(dhcpv6_entry.get('address'))}"
             mac = dhcpv6_entry.get("mac")
             mac = mac.lower()
             hostname = dhcpv6_entry.get("hostname")
@@ -567,14 +590,78 @@ def process_dhcpv6(redis_client):
             dhcpv6_entry["address"] = [address] if address else []
             dhcpv6_entry["hostname"] = [hostname] if hostname else []
             if mac:
-                update_redis_entry(redis_client, redis_key_mac, dhcpv6_entry)
+                update_redis_entryv2(redis_client, redis_key_mac, dhcpv6_entry, keep_cache, ['address','hostname'])
             if address:
-                update_redis_entry(redis_client, redis_key_address, dhcpv6_entry)
+                update_redis_entryv2(redis_client, redis_key_address, dhcpv6_entry, keep_cache, ['hostname'])
             if hostname:
-                update_redis_entry(redis_client, redis_key_hostname, dhcpv6_entry)
-        print(f"DHCPv6 entrys pulled: {len(data['rows'])}")
+                update_redis_entryv2(redis_client, redis_key_hostname, dhcpv6_entry, keep_cache, ['mac', 'address'])
+        logdatamessage(f"ISC DHCPv6 entrys pulled: {len(data['rows'])}")
     list_of_dhcpv6_keys = redis_client.keys("dhcpv6:*")
-    print(f"DHCPv6 keys in Redis: {len(list_of_dhcpv6_keys)}")
+    logdatamessage(f"ISC DHCPv6 keys in Redis: {len(list_of_dhcpv6_keys)}")
+
+def process_keadhcpv4(redis_client):
+    """Collects and stores DHCPv4 data in Redis."""
+    data = get_opnsense_data("/kea/dhcpv4/search_reservation")
+    if data:
+        if debug:
+            pprint(data['rows'][0:5])
+        for dhcpv4_entry in data['rows']:
+            address = f"{ipaddress.IPv4Address(dhcpv4_entry.get('ip_address'))}"
+            mac = dhcpv4_entry.get("hw_address")
+            mac = mac.lower()
+            hostname = dhcpv4_entry.get("hostname")
+            hostname = hostname.lower() if hostname else None
+            redis_key_mac = f"dhcpv4:mac:{mac}"
+            redis_key_address = f"dhcpv4:address:{address}"
+            redis_key_hostname = f"dhcpv4:hostname:{hostname}"
+            dhcpv4_entry["mac"] = [mac] if mac else []
+            dhcpv4_entry["address"] = [address] if address else []
+            dhcpv4_entry["hostname"] = [hostname] if hostname else []
+            if mac:
+                update_redis_entryv2(redis_client, redis_key_mac, dhcpv4_entry, keep_cache, ['address','hostname'])
+            if address:
+                update_redis_entryv2(redis_client, redis_key_address, dhcpv4_entry, keep_cache, ['hostname'])
+            if hostname:
+                update_redis_entryv2(redis_client, redis_key_hostname, dhcpv4_entry, keep_cache, ['mac', 'address'])
+        logdatamessage(f"KEA DHCPv4 entrys pulled: {len(data['rows'])}")
+    list_of_dhcpv4_keys = redis_client.keys("dhcpv4:*")
+    logdatamessage(f"KEA DHCPv4 keys in Redis: {len(list_of_dhcpv4_keys)}")
+
+def process_keadhcpv6(redis_client):
+    """Collects and stores DHCPv6 data in Redis."""
+    data = get_opnsense_data("/kea/dhcpv6/search_subnet")
+    if data:
+        if debug:
+            pprint(data)
+            # ['rows'][0:5])
+        for dhcpv6_subnet in data['rows']:
+            subnet_data = get_opnsense_data(f"/kea/dhcpv6/get_subnet?$uuid={dhcpv6_subnet['uuid']}")
+            if subnet_data:
+                if debug:
+                    pprint(subnet_data)
+                if 'rows' in subnet_data:
+                    for dhcpv6_entry in subnet_data['rows']:
+                        address = f"{ipaddress.IPv6Address(dhcpv6_entry.get('ip_address'))}"
+                        mac = dhcpv6_entry.get("hw_address")
+                        mac = mac.lower()
+                        hostname = dhcpv6_entry.get("hostname")
+                        hostname = hostname.lower() if hostname else None
+                        redis_key_mac = f"dhcpv6:mac:{mac}"
+                        redis_key_address = f"dhcpv6:address:{address}"
+                        redis_key_hostname = f"dhcpv6:hostname:{hostname}"
+                        dhcpv6_entry["mac"] = [mac] if mac else []
+                        dhcpv6_entry["address"] = [address] if address else []
+                        dhcpv6_entry["hostname"] = [hostname] if hostname else []
+                        if mac:
+                            update_redis_entryv2(redis_client, redis_key_mac, dhcpv6_entry, keep_cache, ['address','hostname'])
+                        if address:
+                            update_redis_entryv2(redis_client, redis_key_address, dhcpv6_entry, keep_cache, ['hostname'])
+                        if hostname:
+                            update_redis_entryv2(redis_client, redis_key_hostname, dhcpv6_entry, keep_cache, ['mac', 'address'])
+                    logdatamessage(f"KEA DHCPv6 entrys pulled: {len(subnet_data['rows'])}")
+        logdatamessage(f"KEA DHCPv6 subnets pulled: {len(data['rows'])}")
+    list_of_dhcpv6_keys = redis_client.keys("dhcpv6:*")
+    logdatamessage(f"KEA DHCPv6 keys in Redis: {len(list_of_dhcpv6_keys)}")
 
 def process_interfaces(redis_client):
     """Collects and stores OPNSense Interface data in Redis."""
@@ -600,16 +687,16 @@ def process_interfaces(redis_client):
                 if type(v) == type(str):
                     cleaned_entry[k] = v
             if mac:
-                update_redis_entry(redis_client, redis_key_mac, cleaned_entry)
-            if hostname:
-                update_redis_entry(redis_client, redis_key_hostname, cleaned_entry)
+                update_redis_entryv2(redis_client, redis_key_mac, cleaned_entry, keep_cache, ['address','hostname'])
             for address in alladdresses:
                 if address:
                     redis_key_address = f"interface:address:{address}"
-                    update_redis_entry(redis_client, redis_key_address, cleaned_entry)
-        print(f"Interface entrys pulled: {len(data)}")
+                    update_redis_entryv2(redis_client, redis_key_address, cleaned_entry, keep_cache, ['hostname'])
+            if hostname:
+                update_redis_entryv2(redis_client, redis_key_hostname, cleaned_entry, keep_cache, ['mac', 'address'])
+        logdatamessage(f"Interface entrys pulled: {len(data)}")
     list_of_interface_keys = redis_client.keys("interface:*")
-    print(f"Interface keys in Redis: {len(list_of_interface_keys)}")
+    logdatamessage(f"Interface keys in Redis: {len(list_of_interface_keys)}")
 
 def process_docker_containers(redis_client):
     # Step 1: Authenticate with Portainer
@@ -624,17 +711,17 @@ def process_docker_containers(redis_client):
         }
         response = requests.get(endpoints_url, headers=headers)
         if response.status_code != 200:
-            print("Authentication failed - token failed or expired")
+            logdatamessage("Authentication failed - token failed or expired")
             token_data = None
             portainer_jwt_token = None
         else:
-            print("Using saved token.")
+            logdatamessage("Using saved token.")
     if not portainer_jwt_token:
-        print("Authenticating to get a new token.")
+        logdatamessage("Authenticating to get a new token.")
         try:
             portainer_jwt_token = portainer_authenticate(portainer_username, portainer_password)
             portainer_save_token(portainer_jwt_token, token_file)
-            print("New token obtained and saved.")
+            logdatamessage("New token obtained and saved.")
         except requests.exceptions.RequestException as e:
             print(f"Authentication failed: {e}")
             exit()
@@ -649,35 +736,35 @@ def process_docker_containers(redis_client):
         print("Failed to retrieve endpoints")
         exit()
     endpoints = response.json()
-    print(f"Found {len(endpoints)} endpoint(s)")
+    logdatamessage(f"Found {len(endpoints)} endpoint(s)")
     container_list = []
     # Step 3: Iterate Over Endpoints and Containers
     for endpoint in endpoints:
         endpoint_id = endpoint['Id']
         endpoint_status = endpoint['Status']
-        print(f"Looking into {endpoint['Name']} with status {endpoint_status}...")
+        logdatamessage(f"Looking into {endpoint['Name']} with status {endpoint_status}...")
         if endpoint_status != 1:
-            print(f"Skipping inactive endpoint...")
+            logdatamessage(f"Skipping inactive endpoint...")
             continue
-        if 'Snapshots' not in endpoint or not endpoint['Snapshots']:
-            print(f"No Docker Snapshots found for endpoint {endpoint_id}")
-            continue
-        if 'DockerSnapshotRaw' not in endpoint['Snapshots'][0]:
-            print(f"No DockerSnapshotRaw found in endpoint {endpoint_id}")
-            continue
-        if not endpoint['Snapshots'][0]['DockerSnapshotRaw'].get('Containers'):
-            print(f"No Docker Containers found in endpoint {endpoint_id}")
-            pprint(endpoint['Snapshots'])
-            print("Exiting...")
-            sys.exit(0)
-        print(f"Which has {len(endpoint['Snapshots'][0]['DockerSnapshotRaw']['Containers'])} Docker Snapshots Container Definitions")
+        # if 'Snapshots' not in endpoint or not endpoint['Snapshots']:
+        #     logdatamessage(f"No Docker Snapshots found for endpoint {endpoint_id}")
+        #     continue
+        # if 'DockerSnapshotRaw' not in endpoint['Snapshots'][0]:
+        #     logdatamessage(f"No DockerSnapshotRaw found in endpoint {endpoint_id}")
+        #     continue
+        # if not endpoint['Snapshots'][0]['DockerSnapshotRaw'].get('Containers'):
+        #     logdatamessage(f"No Docker Containers found in endpoint {endpoint_id}")
+        #     pprint(endpoint['Snapshots'])
+        #     logdatamessage("Exiting...")
+        #     sys.exit(0)
         containers_url = f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json?all=true"
         response = requests.get(containers_url, headers=headers)
         if response.status_code != 200:
-            print(f"Failed to retrieve containers from endpoint {endpoint_id}")
+            logdatamessage(f"Failed to retrieve containers from endpoint {endpoint_id}")
             #pprint(response.text)
             continue
         containers = response.json()
+        logdatamessage(f"Which has {len(containers)} Docker Snapshots Container Definitions")
         for container in containers:
             if 'Id' in container:
                 pass
@@ -688,14 +775,14 @@ def process_docker_containers(redis_client):
             container_info_url = f"{portainer_url}/api/endpoints/{endpoint_id}/docker/containers/{container_id}/json"
             response = requests.get(container_info_url, headers=headers)
             if response.status_code != 200:
-                print(f"Failed to get details for container {container_id}")
+                logdatamessage(f"Failed to get details for container {container_id}")
                 continue
             container_details = response.json()
             # Step 5: Extract Hostname
             hostname = container_details.get('Config', {}).get('Hostname', 'N/A')
             # check if the container is running
             if container_details.get('State', {}).get('Running') is not True:
-                print(f"Container {container_id} - {hostname} is not running, skipping...")
+                logdatamessage(f"Container {container_id} - {hostname} is not running, skipping...")
                 continue
             # Step 6: Extract IP and MAC Address from NetworkSettings
             network_settings = container_details.get('NetworkSettings', {})
@@ -736,14 +823,54 @@ def process_docker_containers(redis_client):
             alladdresses = container_entry["address"]
             for mac in macs:
                 redis_key_mac = f"docker:mac:{mac}"
-                update_redis_entry(redis_client, redis_key_mac, container_entry)
-            for hostname in hostnames:
-                redis_key_hostname = f"docker:hostname:{hostname}"
-                update_redis_entry(redis_client, redis_key_hostname, container_entry)
+                update_redis_entryv2(redis_client, redis_key_mac, container_entry, keep_cache, ['address','hostname'])
             for address in alladdresses:
                 if address:
                     redis_key_address = f"docker:address:{address}"
-                    update_redis_entry(redis_client, redis_key_address, container_entry)
+                    update_redis_entryv2(redis_client, redis_key_address, container_entry, keep_cache, ['hostname'])
+            for hostname in hostnames:
+                redis_key_hostname = f"docker:hostname:{hostname}"
+                update_redis_entryv2(redis_client, redis_key_hostname, container_entry, keep_cache, ['mac', 'address'])
+
+def is_ipv6_in_range(ipv6_address: str, start_range: str, end_range: str) -> bool:
+    """
+    Checks if a given IPv6 address is within a specified range of IPv6 addresses.
+
+    Args:
+        ipv6_address: The IPv6 address to check (as a string).
+        start_range: The starting IPv6 address of the range (as a string).
+        end_range: The ending IPv6 address of the range (as a string).
+
+    Returns:
+        True if the IPv6 address is within the range (inclusive), False otherwise.
+    """
+    try:
+        ip_to_check = ipaddress.IPv6Address(ipv6_address)
+        range_start = ipaddress.IPv6Address(start_range)
+        range_end = ipaddress.IPv6Address(end_range)
+
+        return range_start <= ip_to_check <= range_end
+    except ipaddress.AddressValueError as e:
+        print(f"Error: Invalid IPv6 address provided: {e}")
+        return False
+
+def get_ipv6_subnet(ip_address):
+    if ':' in ip_address:  # IPv6
+        ipv6_obj = ipaddress.IPv6Address(ip_address)
+        subnet = ip_address[0:19]
+        bytes_value = ipv6_obj._ip.to_bytes(16, 'big')
+        nibbles = []
+        for byte in bytes_value:
+            hex_byte = '{:02x}'.format(byte)
+            for c in hex_byte:
+                nibbles.append(c)
+        reversed_nibbles = list(reversed(nibbles))
+        ptr_domain = '.'.join(reversed_nibbles) + '.ip6.arpa.'
+    else:  # IPv4
+        octets = ip_address.split('.')
+        subnet = '.'.join(octets[0:3])
+        ptr_domain = '.'.join(reversed(octets)) + '.in-addr.arpa.'
+    return subnet, ptr_domain
 
 def create_dns_updatesv2(hosts_data):
     print_existing = False  # For debugging purposes only
@@ -839,7 +966,7 @@ def create_dns_updatesv2(hosts_data):
         pprint(hosts_data)
         print("forward records:")
         pprint(forward_records)
-    print(f"IN - checking the updates list for add/delete to existing...")
+    logdatamessage(f"IN - checking the updates list for add/delete to existing...")
     # First pass: Add new records
     print_existing = False
     for hostname, ips in hosts_data.items():
@@ -852,58 +979,72 @@ def create_dns_updatesv2(hosts_data):
                 ip_type = 'AAAA' if ':' in ip_address else 'A'
                 if ip_address in forward_records[hostname]:
                     if print_existing:
-                        print(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
+                        logdatamessage(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
                     continue
                 else:
-                    print(f"Adding {ip_type} record: {fqdn} -> {ip_address}")
+                    logdatamessage(f"Adding {ip_type} record: {fqdn} -> {ip_address}")
                     fwd_update.add(hostname, 3600, ip_type, ip_address)
                     pending_changes['add'][ip_type].append((hostname, ip_address))
             for ip_address in forward_records[hostname]:
                 ip_type = 'AAAA' if ':' in ip_address else 'A'
                 if ip_address in ips:
                     if print_existing:
-                        print(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
+                        logdatamessage(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
                     continue
                 else:
-                    print(f"Removing {ip_type} record: {ip_address} from {fqdn}")
+                    logdatamessage(f"Removing {ip_type} record: {ip_address} from {fqdn}")
                     fwd_update.delete(hostname, ip_type, ip_address)
                     pending_changes['delete'][ip_type].append((fqdn, ip_address))
         else:
             for ip_address in ips:
                 ip_type = 'AAAA' if ':' in ip_address else 'A'
-                print(f"Adding {ip_type} record: {fqdn} -> {ip_address}")
+                logdatamessage(f"Adding {ip_type} record: {fqdn} -> {ip_address}")
                 fwd_update.add(hostname, 3600, ip_type, ip_address)
                 pending_changes['add'][ip_type].append((hostname, ip_address))
     for hostname, ips in forward_records.items():
         fqdn = f"{hostname}.{dns_domain}"
         if hostname in hosts_data.keys():
-            if print_existing:
-                print(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
-            continue
+            for ip_address in ips:
+                if ip_address not in hosts_data[hostname]:
+                    ip_type = 'AAAA' if ':' in ip_address else 'A'
+                    logdatamessage(f"Removing {ip_type} record: {ip_address} from {fqdn}")
+                    fwd_update.delete(hostname, ip_type, ip_address)
+                    pending_changes['delete'][ip_type].append((fqdn, ip_address))
+                else:
+                    if print_existing:
+                        logdatamessage(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
+                    continue
+        elif hostname in bad_hostnames:
+            for ip_address in ips:
+                ip_type = 'AAAA' if ':' in ip_address else 'A'
+                logdatamessage(f"Removing {ip_type} record: {ip_address} from {fqdn}")
+                fwd_update.delete(hostname, ip_type, ip_address)
+                pending_changes['delete'][ip_type].append((fqdn, ip_address))
         else:
             for ip_address in ips:
                 ip_type = 'AAAA' if ':' in ip_address else 'A'
-                print(f"Removing {ip_type} record: {ip_address} from {fqdn}")
+                logdatamessage(f"Removing {ip_type} record: {ip_address} from {fqdn}")
                 fwd_update.delete(hostname, ip_type, ip_address)
                 pending_changes['delete'][ip_type].append((fqdn, ip_address))
-    print(f"PTR - checking the updates list for add/delete to existing...")
+    logdatamessage(f"PTR - checking the updates list for add/delete to existing...")
     # Update Reverse PTR Records
-    for subnet_update, ptr_update in ptr_updates.items():
+    for subnet_update in ptr_updates.keys():
         if subnet_update not in reverse_zones:
-            print(f"Skipping PTR cleanup for unknown subnet: {subnet_update}")
+            logdatamessage(f"Skipping PTR cleanup for unknown subnet: {subnet_update}")
         reverse_zone = reverse_zones[subnet_update]
-        print(f"Checking PTR records for subnet {subnet_update} in zone {reverse_zone}...")
+        if report_findings:
+            logdatamessage(f"Checking PTR records for subnet {subnet_update} in zone {reverse_zone}...")
         ptr_records = get_reverse_records_for_zone(dns_server, reverse_zone)
         if '.' in subnet_update:
             subnet = f"{subnet_update}0/24"
         else:
             subnet = f"{subnet_update}:/64"
-        print(f"Found {len(ptr_records)} PTR records in subnet {subnet}.")
+        logdatamessage(f"Found {len(ptr_records)} PTR records in subnet {subnet}.")
         if debug:
             pprint(ptr_records)
-
+        # Check host_data entries
         for hostname, ips in hosts_data.items():
-            report_findings = True
+            # report_findings = True
             if not ips:
                 # skip
                 continue
@@ -914,26 +1055,23 @@ def create_dns_updatesv2(hosts_data):
             fqdn = f"{hostname}.{dns_domain}."
             # Check each IP and add if missing
             for ip_address in subnet_ips:
+                ptr_subnet, ptr_domain = get_ptr_domain(ip_address)
                 if ip_address in ptr_records.keys():
                     if fqdn in ptr_records[ip_address]:
                         # Keep
                         continue
                     else:
                         # Add
-                        ptr_subnet, ptr_domain = get_ptr_domain(ip_address)
                         if report_findings:
-                            print(f"Adding PTR record: {ptr_domain} -> {fqdn} - missing FQDN")
+                            logdatamessage(f"Adding PTR record: {ptr_domain} -> {fqdn} - missing FQDN")
                         ptr_updates[subnet_update].add(ptr_domain, 3600, 'PTR', fqdn)
                         pending_changes['add'][f'PTR{"IPv6" if ":" in ip_address else "IPv4"}'].append((ptr_domain, fqdn))
-                        pass
                 else:
                     # Add
-                    ptr_subnet, ptr_domain = get_ptr_domain(ip_address)
                     if report_findings:
-                        print(f"Adding PTR record: {ptr_domain} -> {fqdn} - missing IP + FQDN")
+                        logdatamessage(f"Adding PTR record: {ptr_domain} -> {fqdn} - missing IP + FQDN")
                     ptr_updates[subnet_update].add(ptr_domain, 3600, 'PTR', fqdn)
                     pending_changes['add'][f'PTR{"IPv6" if ":" in ip_address else "IPv4"}'].append((ptr_domain, fqdn))
-                    pass
             for ptr_ip_address, ptr_fqdns in ptr_records.items():
                 if fqdn in ptr_fqdns:
                     if ptr_ip_address in subnet_ips:
@@ -942,11 +1080,38 @@ def create_dns_updatesv2(hosts_data):
                     else:
                         ptr_subnet, ptr_domain = get_ptr_domain(ptr_ip_address)
                         # Delete
-                        if report_findings:
-                            print(f"Removing PTR record: {ptr_ip_address} -> {fqdn} - IP for Hostname {hostname} not found in hosts_data")
+                        #if report_findings:
+                        logdatamessage(f"Removing PTR record: {ptr_ip_address} -> {fqdn} - IP for Hostname {hostname} not found in hosts_data")
                         ptr_updates[subnet_update].delete(ptr_domain, 'PTR', fqdn)
                         pending_changes['delete'][f'PTR{"IPv6" if ":" in ptr_ip_address else "IPv4"}'].append((ptr_domain, fqdn))
-                        pass
+        # Check all PTR Entries
+        for ptr_ip_address, ptr_fqdns in ptr_records.items():
+            ptr_subnet, ptr_domain = get_ptr_domain(ptr_ip_address)
+            for ptr_fqdn in ptr_fqdns:
+                ptr_fqdn_parts = ptr_fqdn.split('.')
+                ptr_hostname = '.'.join(ptr_fqdn_parts[:-3])
+                if report_findings:
+                    logdatamessage(f"Checking PTR record {ptr_hostname} ({ptr_fqdn}) for {ptr_ip_address}...")
+                if ptr_hostname in bad_hostnames:
+                    if (ptr_domain, ptr_fqdn) not in pending_changes['delete'][f'PTR{"IPv6" if ":" in ptr_ip_address else "IPv4"}']:
+                        logdatamessage(f"Removing PTR record: {ptr_ip_address} -> {ptr_hostname} found in bad_hostnames")
+                        ptr_updates[subnet_update].delete(ptr_domain, 'PTR', ptr_fqdn)
+                        pending_changes['delete'][f'PTR{"IPv6" if ":" in ptr_ip_address else "IPv4"}'].append((ptr_domain, ptr_fqdn))
+                elif ptr_hostname not in hosts_data:
+                    logdatamessage(f"Removing PTR record: {ptr_hostname} not found in hosts_data")
+                    ptr_updates[subnet_update].delete(ptr_domain, 'PTR', ptr_fqdn)
+                    pending_changes['delete'][f'PTR{"IPv6" if ":" in ptr_ip_address else "IPv4"}'].append((ptr_domain, ptr_fqdn))
+                elif ptr_hostname in hosts_data:
+                    if ptr_ip_address not in hosts_data[ptr_hostname]:
+                        logdatamessage(f"Removing PTR record: {ptr_hostname} ({ptr_ip_address}) not found in hosts_data")
+                        ptr_updates[subnet_update].delete(ptr_domain, 'PTR', ptr_fqdn)
+                        pending_changes['delete'][f'PTR{"IPv6" if ":" in ptr_ip_address else "IPv4"}'].append((ptr_domain, ptr_fqdn))
+                # elif ptr_hostname not in hosts_data:
+                #     ptr_subnet, ptr_domain = get_ptr_domain(ptr_ip_address)
+                #     if (ptr_domain, ptr_fqdn) not in pending_changes['delete'][f'PTR{"IPv6" if ":" in ptr_ip_address else "IPv4"}']:
+                #         logdatamessage(f"Removing PTR record: {ptr_ip_address} -> {ptr_hostname} not in hostnames")
+                #         ptr_updates[subnet_update].delete(ptr_domain, 'PTR', ptr_fqdn)
+                #         pending_changes['delete'][f'PTR{"IPv6" if ":" in ptr_ip_address else "IPv4"}'].append((ptr_domain, ptr_fqdn))
                 else:
                     # Skip - fqdn is not in this record set
                     continue
@@ -955,14 +1120,17 @@ def create_dns_updatesv2(hosts_data):
 def main():
     """Main function to collect and store data."""
 
+    # Setup Redis logging connection
+    redis_logging_client = connect_to_redis(5)
+
     # Initialize Redis connection
-    redis_client = connect_to_redis()
+    redis_client = connect_to_redis(6)
     if not redis_client:
         print("Failed to connect to Redis. Exiting...")
         return
-    print("Connected to Redis.")
+    logdatamessage("Connected to Redis.")
 
-    print("Cleaning up problematic records...")
+    logdatamessage("Cleaning up problematic records...")
     for pattern in KEY_PATTERNS:
         cached_data = get_all_data_from_redis(redis_client, pattern)
         for k, v in cached_data.items():
@@ -970,53 +1138,69 @@ def main():
                 if key == 'hostname':
                     for badhostname in bad_hostnames:
                         if badhostname in value:
-                            print(f"Cleaning up problematic hostname '{badhostname}' in {k}")
+                            logdatamessage(f"Cleaning up problematic hostname '{badhostname}' in {k}")
                             v['hostname'] = [h for h in value if h != badhostname]
                             if len(v['hostname']) == 0:
-                                print(f"Removing {k} as no hostnames remain")
+                                logdatamessage(f"Removing {k} as no hostnames remain")
                                 redis_client.delete(k)
                                 continue
                             else:
                                 # Update the record with cleaned hostname
-                                print(f"Updating {k} with cleaned hostname")
+                                logdatamessage(f"Updating {k} with cleaned hostname")
                                 redis_client.set(k, json.dumps(v))
                             # to_delete_macs = v['macs']
                             # to_delete_ips = v['addresses']
                             # for delete_mac in to_delete_macs:
                             #     redis_client.delete
+                    if key == 'hostname' and len(value) > 0 and v['hostname'][0] in multihost_list:
+                        continue
+                    elif len(v['mac']) > 1:
+                        logdatamessage(f"found multiple MAC on {k} - {v['hostname'][0] if 'hostname' in v.keys() and len(v['hostname']) > 0 else 'N/A'}")
+                        #pprint(v)
     redis_client.save()
-
-    print("Checking if all systems are up...")
+    logdatamessage("Checking if all systems are up...")
     if not all_systems_up(redis_client):
         print("One or more systems are not responding. Exiting...")
         return
-    print("All systems are up and running.")
+    logdatamessage("All systems are up and running.")
+
+    if keep_cache:
+        logdatamessage("Keeping DNS cache from Redis")
+    else:
+        logdatamessage("Ignoring DNS cache from Redis")
+
     #list_of_keys = redis_client.keys("*")
     #for key in list_of_keys:
     #   redis_client.delete(key)
 
     # Collect and process data
-    print("Collecting ARP data...")
+    logdatamessage("Collecting ARP data...")
     process_arp(redis_client)
 
-    print("Collecting NDP data...")
+    logdatamessage("Collecting NDP data...")
     process_ndp(redis_client)
 
-    print("Collecting DHCPv4 data...")
-    process_dhcpv4(redis_client)
+    # logdatamessage("Collecting ISC DHCPv4 data...")
+    # process_dhcpv4(redis_client)
 
-    print("Collecting DHCPv6 data...")
-    process_dhcpv6(redis_client)
+    # logdatamessage("Collecting ISC DHCPv6 data...")
+    # process_dhcpv6(redis_client)
 
-    print("Collecting Interface data...")
+    logdatamessage("Collecting KEA DHCPv4 data...")
+    process_keadhcpv4(redis_client)
+
+    logdatamessage("Collecting KEA DHCPv6 data...")
+    process_keadhcpv6(redis_client)
+
+    logdatamessage("Collecting Interface data...")
     process_interfaces(redis_client)
     if not all_systems_up(redis_client):
         print("One or more systems are not responding. Exiting...")
         return
-    print("Collecting Docker Container data...")
+    logdatamessage("Collecting Docker Container data...")
     process_docker_containers(redis_client)
 
-    print("Collecting Static Host data...")
+    logdatamessage("Collecting Static Host data...")
     staticrecords = {}
     for statichost in statichosts:
         staticrecord = {
@@ -1025,30 +1209,32 @@ def main():
             'address': []
         }
         statichostsplit = statichost.split('/')
+        # print(f"working: {statichost}")
         for element in range(len(statichostsplit)):
-            if statichostsplit[element] == 'hostname':
-                staticrecord['hostname'].append(statichostsplit[element + 1])
-                if staticrecord['hostname'][0] not in staticrecords:
-                    staticrecords[staticrecord['hostname'][0]] = {}
             if statichostsplit[element] == 'mac':
-                staticrecord['mac'].append(statichostsplit[element + 1])
+                staticrecord['mac'].append(statichostsplit[element + 1].lower())
+                if staticrecord['mac'][0] not in staticrecords:
+                    staticrecords[staticrecord['mac'][0]] = {}
+            if statichostsplit[element] == 'hostname':
+                staticrecord['hostname'].append(statichostsplit[element + 1].lower())
             if statichostsplit[element] == 'address':
-                staticrecord['address'].append(statichostsplit[element + 1])
-        staticrecords[staticrecord['hostname'][0]]['hostname'] = list(set(staticrecord['hostname'] + staticrecords[staticrecord['hostname'][0]].get('hostname', [])))
-        staticrecords[staticrecord['hostname'][0]]['mac'] = list(set(staticrecord['mac'] + staticrecords[staticrecord['hostname'][0]].get('mac', [])))
-        staticrecords[staticrecord['hostname'][0]]['address'] = list(set(staticrecord['address'] + staticrecords[staticrecord['hostname'][0]].get('address', [])))
-    for hostname, record in staticrecords.items():
-        redis_key_hostname = f"static:hostname:{hostname}"
-        update_redis_entry(redis_client, redis_key_hostname, record)
-        for mac in record['mac']:
-            redis_key_mac = f"static:mac:{mac}"
-            update_redis_entry(redis_client, redis_key_mac, record)
+                staticrecord['address'].append(statichostsplit[element + 1].lower())
+        staticrecords[staticrecord['mac'][0]]['hostname'] = list(set(staticrecord['hostname'] + staticrecords[staticrecord['mac'][0]].get('hostname', [])))
+        staticrecords[staticrecord['mac'][0]]['mac'] = list(set(staticrecord['mac'] + staticrecords[staticrecord['mac'][0]].get('mac', [])))
+        staticrecords[staticrecord['mac'][0]]['address'] = list(set(staticrecord['address'] + staticrecords[staticrecord['mac'][0]].get('address', [])))
+        # pprint(staticrecords[staticrecord['mac'][0]])
+    for mac, record in staticrecords.items():
+        redis_key_mac = f"static:mac:{mac}"
+        update_redis_entryv2(redis_client, redis_key_mac, record, keep_cache, ['address','hostname'])
+        for hostname in record['hostname']:
+            redis_key_hostname = f"static:hostname:{hostname}"
+            update_redis_entryv2(redis_client, redis_key_hostname, record, keep_cache, ['mac', 'address'])
         for address in record['address']:
             redis_key_address = f"static:address:{address}"
-            update_redis_entry(redis_client, redis_key_address, record)
+            update_redis_entryv2(redis_client, redis_key_address, record, keep_cache, ['hostname'])
     redis_client.save()
     time.sleep(2)
-    print("Data collection complete.")
+    logdatamessage("Data collection complete.")
     if not all_systems_up(redis_client):
         print("One or more systems are not responding. Exiting...")
         return
@@ -1069,29 +1255,35 @@ def main():
     if not all_systems_up(redis_client):
         print("One or more systems are not responding. Exiting...")
         return
-    # Clean up stale records
-    print("Cleaning up stale records...")
+    # Clean up stale records by IP
+    logdatamessage("Cleaning up stale records...")
     for pattern in KEY_PATTERNS:
+        logdatamessage(f"working pattern: {pattern}")
         cached_data = get_all_data_from_redis(redis_client, pattern)
         for k, v in cached_data.items():
             ips_to_remove = []
             hostname = v.get('hostname', [None])
             hostname = hostname[0] if hostname else None
-            if datetime.strptime(v['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=4) <= datetime.now():
-                print(f"Removing {k} as last_seen is older than 4 hours")
+            if datetime.strptime(v['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(minutes=5) <= datetime.now():
+                logdatamessage(f"Removing {k} as last_seen is older than 5 minutes")
                 redis_client.delete(k)
                 continue
             for key, value in v.items():
                 if key == 'address':
                     if len(value) == 0:
-                        print(f"Removing {k} as no addresses remain")
+                        logdatamessage(f"Removing {k} as no addresses remain")
                         redis_client.delete(k)
                         continue
                     for address in value:
                         addressgood = False
                         # Skip IPv6 for IPv4-only hosts
+                        ipv6_subnet, ipv6_domain = get_ipv6_subnet(address)
                         if hostname in ipv4_only_hosts and ':' in address:
-                            print(f"Cleaning up IPv6 record for {address} in {k} IPv4 only host {hostname}")
+                            logdatamessage(f"Cleaning up IPv6 record for {address} in {k} IPv4 only host {hostname}")
+                        #elif ':' in address and is_ipv6_in_range(address, f"{ipv6_subnet}::1000", f"{ipv6_subnet}::2000"):
+                        #    logdatamessage(f"Cleaning up IPv6 record for {address} in {k} Bad Range {hostname}")
+                        elif address in bad_addresses:
+                            logdatamessage(f"Cleaning up IPv6 record for {address} in {k} Bad Address {hostname}")
                         else:
                             address_pattern = f"*:address:{address}"
                             check_data = get_data_from_redis(redis_client, address_pattern)
@@ -1100,14 +1292,14 @@ def main():
                                     if check_value:
                                         if 'last_seen' in check_value:
                                             if datetime.strptime(check_value['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=1) <= datetime.now():
-                                                print(f"Cleaning up stale record for {address} in {k} with 'last_seen' of {check_value['last_seen']}")
+                                                logdatamessage(f"Cleaning up stale record for {address} in {k} with 'last_seen' of {check_value['last_seen']}")
                                             else:
                                                 if debug:
                                                     print(f"Keeping record for {address} in {k}")
                                                 addressgood = True
                                                 break
                                         else:
-                                            print(f"Cleaning up stale record for {address} in {k} no last_seen value")
+                                            logdatamessage(f"Cleaning up stale record for {address} in {k} no last_seen value")
                                     else:
                                         if debug:
                                             print(f"Cleaning up stale record for {address} in {k} no check value")
@@ -1126,10 +1318,67 @@ def main():
                         after = len(v_cleanup.get('address', []))
                         if before != after and after > 0:
                             redis_client.set(k_cleanup, json.dumps(v_cleanup))
-                            print(f"Updated {k_cleanup} with {before} -> {after} addresses after cleanup")
+                            logdatamessage(f"Updated {k_cleanup} with {before} -> {after} addresses after cleanup")
                         elif after == 0:
                             redis_client.delete(k_cleanup)
-                            print(f"Deleted {k_cleanup} after cleanup as no addresses remain")
+                            logdatamessage(f"Deleted {k_cleanup} after cleanup as no addresses remain")
+                redis_client.save()
+                time.sleep(2)
+        # Clean up stale records by MAC
+        cached_data = get_all_data_from_redis(redis_client, pattern)
+        for k, v in cached_data.items():
+            macs_to_remove = []
+            hostname = v.get('hostname', [None])
+            hostname = hostname[0] if hostname else None
+            if datetime.strptime(v['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=1) <= datetime.now():
+                logdatamessage(f"Removing {k} as last_seen is older than 1 hours")
+                redis_client.delete(k)
+                continue
+            for key, value in v.items():
+                if key == 'mac':
+                    if len(value) == 0:
+                        logdatamessage(f"Removing {k} as no macs remain")
+                        redis_client.delete(k)
+                        continue
+                    for mac in value:
+                        macgood = False
+                        mac_pattern = f"*:mac:{mac}"
+                        check_data = get_data_from_redis(redis_client, mac_pattern)
+                        if check_data:
+                            for check_key, check_value in check_data.items():
+                                if check_value:
+                                    if 'last_seen' in check_value:
+                                        if datetime.strptime(check_value['last_seen'],"%Y-%m-%d %H:%M:%S") + timedelta(hours=1) <= datetime.now():
+                                            logdatamessage(f"Cleaning up stale record for {mac} in {k} with 'last_seen' of {check_value['last_seen']}")
+                                        else:
+                                            if debug:
+                                                print(f"Keeping record for {mac} in {k}")
+                                            macgood = True
+                                            break
+                                    else:
+                                        logdatamessage(f"Cleaning up stale record for {mac} in {k} no last_seen value")
+                                else:
+                                    if debug:
+                                        print(f"Cleaning up stale record for {mac} in {k} no check value")
+                        else:
+                            if debug:
+                                print(f"Cleaning up stale record for {mac} in {k} no check data")
+                        if not macgood:
+                            macs_to_remove.append(mac)
+            if len(macs_to_remove) > 0:
+                macs_to_remove = list(set(macs_to_remove))
+                cached_data_cleanup = get_data_from_redis(redis_client, '*')
+                for k_cleanup, v_cleanup in cached_data_cleanup.items():
+                    if v_cleanup and 'mac' in v_cleanup:
+                        before = len(v_cleanup.get('mac', []))
+                        v_cleanup['mac'] = list(set(v_cleanup.get('mac', [])) - set(macs_to_remove))
+                        after = len(v_cleanup.get('mac', []))
+                        if before != after and after > 0:
+                            redis_client.set(k_cleanup, json.dumps(v_cleanup))
+                            logdatamessage(f"Updated {k_cleanup} with {before} -> {after} macs after cleanup")
+                        elif after == 0:
+                            redis_client.delete(k_cleanup)
+                            logdatamessage(f"Deleted {k_cleanup} after cleanup as no macs remain")
                 redis_client.save()
                 time.sleep(2)
     #sys.exit(0)
@@ -1156,12 +1405,12 @@ def main():
         if 'address' in value_dict and 'mac' in value_dict:
             if len(value_dict['address']) > 0 and len(value_dict['mac']) > 0:
                 cleaned_data.append(value_dict)
-    print("Data cleanup complete.")
+    logdatamessage("Data cleanup complete.")
     #pprint(all_data)
     #sys.exit(0)
     do_fill_in = False
     
-    print("Creating hostname to IP and MAC to IP from Redis data and DNS lookups...")
+    logdatamessage("Creating hostname to IP and MAC to IP from Redis data and DNS lookups...")
     mac_to_ips = {}
     hostname_to_ips = {}
     mac_to_ips_with_no_hostname = {}
@@ -1215,7 +1464,7 @@ def main():
                             hostname = '.'.join(fqdnsplit[:-3])
                             existing_hostnames.append(hostname)
                         if report_findings or len(existing_hostnames) > 1:
-                            print(f"{address} found {len(existing_hostnames)}: {', '.join(existing_hostnames)}")
+                            logdatamessage(f"{address} found {len(existing_hostnames)}: {', '.join(existing_hostnames)}")
                     except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
                         if debug:
                             print(f"Skipping {record_type} record for {address}")
@@ -1269,10 +1518,12 @@ def main():
             for mac, mac_ips in mac_to_ips.items():
                 if host_ip in mac_ips:
                     hostname_to_ips[hostname] = list(set(host_ips + mac_ips))
+                    if hostname in ipv4_only_hosts:
+                        hostname_to_ips[hostname] = [ ip for ip in hostname_to_ips[hostname] if ':' not in ip ]
     if not all_systems_up(redis_client):
         print("One or more systems are not responding. Exiting...")
         return
-    print(f"Processing DNS updates for {len(hostname_to_ips)} hostnames...")
+    logdatamessage(f"Processing DNS updates for {len(hostname_to_ips)} hostnames...")
     try:
         pending_changes = create_dns_updatesv2(hostname_to_ips)
         debug = False
@@ -1286,14 +1537,14 @@ def main():
                 number_of_changes += len(items)
 
         if number_of_changes > 0:
-            print("DNS updates created successfully...")
+            logdatamessage("DNS updates created successfully...")
             # Send updates - UNCOMMENT TO EXECUTE
             if not debug:
                 if not all_systems_up(redis_client):
                     print("One or more systems are not responding. Exiting...")
                     return
                 response = tcp(fwd_update, dns_server)
-                print(f"Forward update response: {response.rcode()}")
+                logdatamessage(f"Forward update response: {response.rcode()}")
 
             if not debug:
                 for subnet, ptr_update in ptr_updates.items():
@@ -1301,19 +1552,38 @@ def main():
                         print("One or more systems are not responding. Exiting...")
                         return
                     response = tcp(ptr_update, dns_server)
-                    print(f"Reverse update response for {subnet}: {response.rcode()}")
+                    logdatamessage(f"Reverse update response for {subnet}: {response.rcode()}")
+            
+            redis_logging_client.set(f"hostlistdns:datetimecheck", starttime.strftime("%Y-%m-%dT%H:%M:%S.%f"))
         else:
-            print("No DNS updates needed.")
+            logdatamessage("No DNS updates needed.")
     except Exception as e:
         print(f"Error during DNS update: {e}")
+
+    stoptime = datetime.now()
 
     if debug:
         pprint(hostname_to_ips)
 
     for mac, ipaddresses in mac_to_ips_with_no_hostname.items():
-        print(f"MAC: {mac} has no hostname at all - {','.join(ipaddresses)}")
+        logdatamessage(f"MAC: {mac} has no hostname at all - {','.join(ipaddresses)}")
+    
+    logdatamessage(f"Done.")
+
+    logmessage = ""
+    for line in log_data:
+        logmessage+=f"{line}\n"
+        #print(line)
+    starttimestr = starttime.strftime("%Y-%m-%d:%H-%M-%S.%f")
+    redis_logging_client.set(f"hostlistdns:log:{starttimestr}", logmessage)
+    redis_logging_client.expire(f"hostlistdns:log:{starttimestr}", 3600)
+    redis_logging_client.set(f"hostlistdns:datetimelast", starttimestr)
+    redis_logging_client.set(f"hostlistdns:durationseconds", str((stoptime - starttime).total_seconds()))
+
     redis_client.save()
     redis_client.close()
-    print(f"Done.")
+    redis_logging_client.save()
+    redis_logging_client.close()
+
 if __name__ == "__main__":
     main()
