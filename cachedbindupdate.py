@@ -34,6 +34,7 @@ api_key = config['OPNSense']['Key']
 secret_key = config['OPNSense']['Secret']
 base_url = config['OPNSense']['URL']
 dns_server = config['DNS']['DNSServer']
+dns_ttl = int(config.get('DNS', 'TTL', fallback=300))  # Default to 300 if not set
 key_name_update = config['DNS']['KeyNameUpdates']
 key_secret_update = config['DNS']['KeySecretUpdate']
 portainer_url = config['Portainer']['URL']
@@ -170,6 +171,21 @@ KEY_PATTERNS = [
     'static:hostname:*',
 ]
 
+def PrintException():
+    exc_type, exc_obj, exc_tb = sys.exc_info()
+    f = exc_tb.tb_frame
+    lineno = exc_tb.tb_lineno
+    filename = f.f_code.co_filename
+
+    with open(filename, 'r') as file:
+        lines = file.readlines()
+        code_line = lines[lineno - 1].strip()
+
+    print(f"An error occurred in {filename} at line {lineno}:")
+    print(f"  Type: {exc_type.__name__}")
+    print(f"  Message: {exc_obj}")
+    print(f"  Code Causing Error: {code_line}")
+
 def logdatamessage(message):
     if debugLog:
         print(message)
@@ -238,7 +254,7 @@ def all_systems_up(redis_client):
             resolver.timeout = 2
             resolver.retry = 3
             # Try to resolve a known domain
-            resolver.resolve('ns02.novalabs.home', 'A')
+            resolver.resolve('ns01.homelab.home', 'A')
         except Exception as e:
             print(f"DNS server not responding: {e}")
             return False
@@ -894,23 +910,28 @@ def create_dns_updatesv2(hosts_data):
         return subnet, ptr_domain
 
     def get_forward_records_for_zone(nameserver, zone_name):
-        """Performs an iterative zone transfer and returns all A and AAAA records."""
+        """Performs a zone transfer and returns A/AAAA records with TTL."""
         try:
             # Initialize the zone transfer
             xfr = dns.query.xfr(nameserver, zone_name)
             zone = dns.zone.from_xfr(xfr)
             records = {}
-            
-            for name in zone.nodes.keys():
-                node = zone.nodes[name]
-                for rdtype in [dns.rdatatype.A, dns.rdatatype.AAAA]:
-                    if any(rdataset.rdtype == rdtype for rdataset in node.rdatasets):
-                        ips = []
-                        for rdataset in node.rdatasets:
-                            if rdataset.rdtype == rdtype:
-                                for rdata in rdataset:
-                                    ips.append(str(rdata.address))
-                        records[str(name)] = list(set(ips + records.get(str(name), [])))
+            for name, node in zone.nodes.items():
+                for rdataset in node.rdatasets:
+                    if rdataset.rdtype in [dns.rdatatype.A, dns.rdatatype.AAAA]:
+                        rdtype_text = dns.rdatatype.to_text(rdataset.rdtype)
+
+                        ips = [rdata.address for rdata in rdataset]
+
+                        records.setdefault(str(name), {})
+                        records[str(name)][rdtype_text] = {
+                            "ips": ips,
+                            "ttl": rdataset.ttl
+                        }
+            for domain in records.keys():
+                for record_type in ['A', 'AAAA']:
+                    if record_type not in records[domain]:
+                        records[domain].setdefault(record_type, {'ips':[], 'ttl': dns_ttl})
             return records
         except Exception as e:
             print(f"Error performing zone transfer: {e}")
@@ -960,7 +981,7 @@ def create_dns_updatesv2(hosts_data):
 
     # Update A and AAAA IN Forward Records
     forward_records = get_forward_records_for_zone(dns_server, dns_domain)
-    debug = False
+    #debug = False
     if debug:
         print("host data:")
         pprint(hosts_data)
@@ -970,62 +991,68 @@ def create_dns_updatesv2(hosts_data):
     # First pass: Add new records
     print_existing = False
     for hostname, ips in hosts_data.items():
-        if not ips:
-            # skip
-            continue
-        fqdn = f"{hostname}.{dns_domain}"
-        if hostname in forward_records.keys():
-            for ip_address in ips:
-                ip_type = 'AAAA' if ':' in ip_address else 'A'
-                if ip_address in forward_records[hostname]:
-                    if print_existing:
-                        logdatamessage(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
-                    continue
-                else:
-                    logdatamessage(f"Adding {ip_type} record: {fqdn} -> {ip_address}")
-                    fwd_update.add(hostname, 3600, ip_type, ip_address)
-                    pending_changes['add'][ip_type].append((hostname, ip_address))
-            for ip_address in forward_records[hostname]:
-                ip_type = 'AAAA' if ':' in ip_address else 'A'
-                if ip_address in ips:
-                    if print_existing:
-                        logdatamessage(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
-                    continue
-                else:
-                    logdatamessage(f"Removing {ip_type} record: {ip_address} from {fqdn}")
-                    fwd_update.delete(hostname, ip_type, ip_address)
-                    pending_changes['delete'][ip_type].append((fqdn, ip_address))
-        else:
-            for ip_address in ips:
-                ip_type = 'AAAA' if ':' in ip_address else 'A'
-                logdatamessage(f"Adding {ip_type} record: {fqdn} -> {ip_address}")
-                fwd_update.add(hostname, 3600, ip_type, ip_address)
-                pending_changes['add'][ip_type].append((hostname, ip_address))
-    for hostname, ips in forward_records.items():
-        fqdn = f"{hostname}.{dns_domain}"
-        if hostname in hosts_data.keys():
-            for ip_address in ips:
-                if ip_address not in hosts_data[hostname]:
+        try:
+            if not ips:
+                # skip
+                continue
+            fqdn = f"{hostname}.{dns_domain}"
+            if hostname in forward_records.keys():
+                for ip_address in ips:
                     ip_type = 'AAAA' if ':' in ip_address else 'A'
-                    logdatamessage(f"Removing {ip_type} record: {ip_address} from {fqdn}")
-                    fwd_update.delete(hostname, ip_type, ip_address)
-                    pending_changes['delete'][ip_type].append((fqdn, ip_address))
+                    if ip_address in forward_records[hostname][ip_type]['ips']:
+                        if print_existing:
+                            logdatamessage(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
+                        continue
+                    else:
+                        logdatamessage(f"Adding {ip_type} record: {fqdn} -> {ip_address}")
+                        fwd_update.add(hostname, dns_ttl, ip_type, ip_address)
+                        pending_changes['add'][ip_type].append((hostname, ip_address))
+                for ip_address in forward_records[hostname][ip_type]['ips']:
+                    ip_type = 'AAAA' if ':' in ip_address else 'A'
+                    if ip_address in ips:
+                        if print_existing:
+                            logdatamessage(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
+                        continue
+                    else:
+                        logdatamessage(f"Removing {ip_type} record: {ip_address} from {fqdn}")
+                        fwd_update.delete(hostname, ip_type, ip_address)
+                        pending_changes['delete'][ip_type].append((fqdn, ip_address))
+            else:
+                for ip_address in ips:
+                    ip_type = 'AAAA' if ':' in ip_address else 'A'
+                    logdatamessage(f"Adding {ip_type} record: {fqdn} -> {ip_address}")
+                    fwd_update.add(hostname, dns_ttl, ip_type, ip_address)
+                    pending_changes['add'][ip_type].append((hostname, ip_address))
+        except Exception as e:
+            print(f"Error during DNS Forward 1st pass: {e}")
+            PrintException()
+    for hostname, answerData in forward_records.items():
+        try:
+            fqdn = f"{hostname}.{dns_domain}"
+            for record_type in ['A', 'AAAA']:
+                if hostname in hosts_data.keys():
+                    for ip_address in answerData[record_type]['ips']:
+                        if ip_address not in hosts_data[hostname]:
+                            logdatamessage(f"Removing {record_type} record: {ip_address} from {fqdn}")
+                            fwd_update.delete(hostname, record_type, ip_address)
+                            pending_changes['delete'][record_type].append((fqdn, ip_address))
+                        else:
+                            if print_existing:
+                                logdatamessage(f"Found existing {record_type} record: {fqdn} -> {ip_address}")
+                            continue
+                elif hostname in bad_hostnames:
+                    for ip_address in answerData[record_type]['ips']:
+                        logdatamessage(f"Removing {record_type} record: {ip_address} from {fqdn}")
+                        fwd_update.delete(hostname, record_type, ip_address)
+                        pending_changes['delete'][record_type].append((fqdn, ip_address))
                 else:
-                    if print_existing:
-                        logdatamessage(f"Found existing {ip_type} record: {fqdn} -> {ip_address}")
-                    continue
-        elif hostname in bad_hostnames:
-            for ip_address in ips:
-                ip_type = 'AAAA' if ':' in ip_address else 'A'
-                logdatamessage(f"Removing {ip_type} record: {ip_address} from {fqdn}")
-                fwd_update.delete(hostname, ip_type, ip_address)
-                pending_changes['delete'][ip_type].append((fqdn, ip_address))
-        else:
-            for ip_address in ips:
-                ip_type = 'AAAA' if ':' in ip_address else 'A'
-                logdatamessage(f"Removing {ip_type} record: {ip_address} from {fqdn}")
-                fwd_update.delete(hostname, ip_type, ip_address)
-                pending_changes['delete'][ip_type].append((fqdn, ip_address))
+                    for ip_address in answerData[record_type]['ips']:
+                        logdatamessage(f"Removing {record_type} record: {ip_address} from {fqdn}")
+                        fwd_update.delete(hostname, record_type, ip_address)
+                        pending_changes['delete'][record_type].append((fqdn, ip_address))
+        except Exception as e:
+            print(f"Error during DNS Forward 2nd pass: {e}")
+            PrintException()
     logdatamessage(f"PTR - checking the updates list for add/delete to existing...")
     # Update Reverse PTR Records
     for subnet_update in ptr_updates.keys():
@@ -1064,7 +1091,7 @@ def create_dns_updatesv2(hosts_data):
                         # Add
                         if report_findings:
                             logdatamessage(f"Adding PTR record: {ptr_domain} -> {fqdn} - missing FQDN")
-                        ptr_updates[subnet_update].add(ptr_domain, 3600, 'PTR', fqdn)
+                        ptr_updates[subnet_update].add(ptr_domain, dns_ttl, 'PTR', fqdn)
                         pending_changes['add'][f'PTR{"IPv6" if ":" in ip_address else "IPv4"}'].append((ptr_domain, fqdn))
                 else:
                     # Add
@@ -1115,6 +1142,31 @@ def create_dns_updatesv2(hosts_data):
                 else:
                     # Skip - fqdn is not in this record set
                     continue
+    # Check and update TTL for each record type
+    for hostname, record_data in forward_records.items():
+        if hostname not in hosts_data:
+            continue
+        for record_type in ['A', 'AAAA']:
+            if record_type not in record_data:
+                continue
+            if report_findings:
+                logdatamessage(f"Checking TTL on domains - {hostname} - {record_type}")
+            current_ttl = record_data[record_type]["ttl"]
+            current_ips = record_data[record_type]["ips"]
+            if current_ttl == dns_ttl:
+                continue
+            fqdn = f"{hostname}.{dns_domain}"
+            logdatamessage(
+                f"Updating TTL for {record_type} {fqdn}: {current_ttl} -> {dns_ttl}"
+            )
+            # Delete entire RRset
+            fwd_update.delete(hostname, record_type)
+            # Re-add all records with correct TTL
+            for ip_address in current_ips:
+                fwd_update.add(hostname, dns_ttl, record_type, ip_address)
+            pending_changes['add'][record_type].append(
+                (hostname, f"TTL {current_ttl} -> {dns_ttl}")
+            )
     return pending_changes
 
 def main():
@@ -1559,6 +1611,7 @@ def main():
             logdatamessage("No DNS updates needed.")
     except Exception as e:
         print(f"Error during DNS update: {e}")
+        PrintException()
 
     stoptime = datetime.now()
 
